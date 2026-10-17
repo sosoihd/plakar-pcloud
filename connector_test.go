@@ -11,7 +11,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"path"
+	"path/filepath"
 	"runtime"
 	"sort"
 	"strconv"
@@ -52,6 +54,36 @@ func newFakePCloudServer() *fakePCloudServer {
 	}
 	s.entries["/"] = &fakeEntry{isFolder: true, modTime: time.Now()}
 	return s
+}
+
+func (s *fakePCloudServer) seedFolder(remotePath string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	remotePath = cleanRemotePath(remotePath)
+	parts := strings.Split(strings.TrimPrefix(remotePath, "/"), "/")
+	cur := ""
+	for _, part := range parts {
+		if part == "" {
+			continue
+		}
+		cur = cur + "/" + part
+		if _, ok := s.entries[cur]; !ok {
+			s.entries[cur] = &fakeEntry{isFolder: true, modTime: time.Now()}
+		}
+	}
+}
+
+func (s *fakePCloudServer) seedFile(remotePath string, content []byte) {
+	remotePath = cleanRemotePath(remotePath)
+	s.seedFolder(path.Dir(remotePath))
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.entries[remotePath] = &fakeEntry{
+		isFolder: false,
+		data:     append([]byte(nil), content...),
+		modTime:  time.Now(),
+	}
 }
 
 func (s *fakePCloudServer) checkAuth(r *http.Request) bool {
@@ -420,53 +452,162 @@ func TestDigestAuthAndPing(t *testing.T) {
 	}
 }
 
-func TestExportAndImport(t *testing.T) {
+// Test1_BackupFileFromPCloudToLocalMac teste la sauvegarde d'un fichier (et d'une arborescence)
+// présent sur pCloud vers un dossier local sur le Mac via le connecteur Importer.
+func Test1_BackupFileFromPCloudToLocalMac(t *testing.T) {
 	fake := newFakePCloudServer()
 	srv := httptest.NewServer(fake)
 	defer srv.Close()
 
-	conn := newTestConnector(t, srv, nil)
-
-	wantFiles := map[string]string{
-		"/backups/alpha.txt":        "hello alpha\n",
-		"/backups/sub/beta.txt":     "hello beta\n",
-		"/backups/sub/deep/gamma.c": "int main() { return 0; }\n",
+	// 1. On place des fichiers sur le serveur pCloud distant
+	pcloudFiles := map[string]string{
+		"/Documents/notes.md":            "# Mes notes sur pCloud\nSauvegardées sur mon Mac via Plakar.\n",
+		"/Documents/projets/readme.txt":  "Contenu du fichier readme depuis pCloud\n",
+		"/Documents/projets/config.json": `{"env":"prod","region":"eu"}`,
 	}
-	wantDirs := []string{
-		"/backups",
-		"/backups/sub",
-		"/backups/sub/deep",
+	for remotePath, content := range pcloudFiles {
+		fake.seedFile(remotePath, []byte(content))
 	}
 
-	// 1. Export directories and files into pCloud
+	// 2. Dossier local sur le Mac qui recevra la sauvegarde issue de pCloud
+	macBackupDir := t.TempDir()
+
+	// 3. On initialise l'Importer pCloud pointant sur /Documents
+	conn := newTestConnector(t, srv, map[string]string{
+		"root": "/Documents",
+	})
+
+	records := make(chan *connectors.Record)
+	done := make(chan struct{})
+
+	go func() {
+		defer close(done)
+		for rec := range records {
+			if rec.Err != nil {
+				t.Errorf("erreur d'import sur %s: %v", rec.Pathname, rec.Err)
+				continue
+			}
+
+			localTarget := filepath.Join(macBackupDir, filepath.FromSlash(rec.Pathname))
+			if rec.FileInfo.IsDir() {
+				if err := os.MkdirAll(localTarget, 0755); err != nil {
+					t.Errorf("mkdir local %s: %v", localTarget, err)
+				}
+				_ = rec.Close()
+				continue
+			}
+
+			if err := os.MkdirAll(filepath.Dir(localTarget), 0755); err != nil {
+				t.Errorf("mkdir parent local %s: %v", localTarget, err)
+				_ = rec.Close()
+				continue
+			}
+
+			data, err := io.ReadAll(rec.Reader)
+			_ = rec.Close()
+			if err != nil {
+				t.Errorf("lecture depuis pCloud %s: %v", rec.Pathname, err)
+				continue
+			}
+
+			if err := os.WriteFile(localTarget, data, 0644); err != nil {
+				t.Errorf("écriture sur le Mac %s: %v", localTarget, err)
+			}
+		}
+	}()
+
+	if err := conn.Import(t.Context(), records, nil); err != nil {
+		t.Fatalf("Import depuis pCloud échoué: %v", err)
+	}
+	<-done
+
+	// 4. On vérifie que chaque fichier de pCloud est bien présent sur le disque du Mac
+	for remotePath, wantContent := range pcloudFiles {
+		localPath := filepath.Join(macBackupDir, filepath.FromSlash(remotePath))
+		gotBytes, err := os.ReadFile(localPath)
+		if err != nil {
+			t.Fatalf("fichier %s non trouvé sur le Mac (%s): %v", remotePath, localPath, err)
+		}
+		if string(gotBytes) != wantContent {
+			t.Errorf("contenu sur le Mac pour %s = %q, attendu %q", remotePath, string(gotBytes), wantContent)
+		}
+	}
+}
+
+// Test2_BackupLocalMacFolderToPCloud teste la sauvegarde d'un dossier local du Mac
+// vers pCloud (via Exporter et via Storage).
+func Test2_BackupLocalMacFolderToPCloud(t *testing.T) {
+	fake := newFakePCloudServer()
+	srv := httptest.NewServer(fake)
+	defer srv.Close()
+
+	// 1. On crée un vrai dossier sur le Mac avec plusieurs fichiers et sous-dossiers
+	macSourceDir := t.TempDir()
+	localFiles := map[string]string{
+		"rapport.txt":             "Rapport annuel depuis mon Mac\n",
+		"scripts/deploy.sh":       "#!/bin/sh\necho 'Deploying to production'\n",
+		"photos/2026/legende.txt": "Souvenirs de voyage\n",
+	}
+
+	for relPath, content := range localFiles {
+		fullLocalPath := filepath.Join(macSourceDir, filepath.FromSlash(relPath))
+		if err := os.MkdirAll(filepath.Dir(fullLocalPath), 0755); err != nil {
+			t.Fatalf("création dossier local sur le Mac: %v", err)
+		}
+		if err := os.WriteFile(fullLocalPath, []byte(content), 0644); err != nil {
+			t.Fatalf("création fichier local sur le Mac: %v", err)
+		}
+	}
+
+	// 2. On configure le connecteur pCloud cible dans /MacBackup
+	conn := newTestConnector(t, srv, map[string]string{
+		"root": "/MacBackup",
+	})
+
 	exportRecords := make(chan *connectors.Record)
 	exportResults := make(chan *connectors.Result)
 
+	// On parcourt le dossier local du Mac et on envoie chaque entrée vers pCloud
 	go func() {
 		defer close(exportRecords)
-		for _, d := range wantDirs {
+		_ = filepath.WalkDir(macSourceDir, func(currentPath string, d fs.DirEntry, walkErr error) error {
+			if walkErr != nil {
+				return walkErr
+			}
+			info, err := d.Info()
+			if err != nil {
+				return err
+			}
+			rel, err := filepath.Rel(macSourceDir, currentPath)
+			if err != nil {
+				return err
+			}
+			slashRel := "/"
+			if rel != "." {
+				slashRel = "/" + filepath.ToSlash(rel)
+			}
+
+			var rd io.ReadCloser
+			if !d.IsDir() {
+				f, err := os.Open(currentPath)
+				if err != nil {
+					return err
+				}
+				rd = f
+			}
+
 			exportRecords <- &connectors.Record{
-				Pathname: strings.TrimPrefix(d, "/backups"),
+				Reader:   rd,
+				Pathname: slashRel,
 				FileInfo: objects.FileInfo{
-					Lname:    path.Base(d),
-					Lmode:    fs.ModeDir | 0755,
-					LmodTime: time.Now(),
+					Lname:    info.Name(),
+					Lsize:    info.Size(),
+					Lmode:    info.Mode(),
+					LmodTime: info.ModTime(),
 				},
 			}
-		}
-		for p, content := range wantFiles {
-			rel := strings.TrimPrefix(p, "/backups")
-			exportRecords <- &connectors.Record{
-				Reader:   io.NopCloser(strings.NewReader(content)),
-				Pathname: rel,
-				FileInfo: objects.FileInfo{
-					Lname:    path.Base(p),
-					Lsize:    int64(len(content)),
-					Lmode:    0644,
-					LmodTime: time.Now(),
-				},
-			}
-		}
+			return nil
+		})
 	}()
 
 	var exportErrs []error
@@ -481,55 +622,27 @@ func TestExportAndImport(t *testing.T) {
 	}()
 
 	if err := conn.Export(t.Context(), exportRecords, exportResults); err != nil {
-		t.Fatalf("Export failed: %v", err)
+		t.Fatalf("Export du dossier Mac vers pCloud échoué: %v", err)
 	}
 	<-doneResults
 	if len(exportErrs) > 0 {
-		t.Fatalf("Export record errors: %v", exportErrs)
+		t.Fatalf("erreurs lors de l'envoi vers pCloud: %v", exportErrs)
 	}
 
-	// 2. Import back from pCloud and verify all files and directories
-	importRecords := make(chan *connectors.Record)
-	gotFiles := make(map[string]string)
-	gotDirs := make(map[string]bool)
-	doneImport := make(chan struct{})
-
-	go func() {
-		defer close(doneImport)
-		for rec := range importRecords {
-			if rec.Err != nil {
-				t.Errorf("unexpected record error on %s: %v", rec.Pathname, rec.Err)
-				continue
-			}
-			if rec.FileInfo.IsDir() {
-				gotDirs[rec.Pathname] = true
-				_ = rec.Close()
-				continue
-			}
-			data, err := io.ReadAll(rec.Reader)
-			if err != nil {
-				t.Errorf("read %s: %v", rec.Pathname, err)
-			}
-			_ = rec.Close()
-			gotFiles[rec.Pathname] = string(data)
+	// 3. On vérifie sur le serveur pCloud que tous les fichiers du Mac y sont bien stockés
+	for relPath, wantContent := range localFiles {
+		remotePCloudPath := path.Join("/MacBackup", relPath)
+		rd, err := conn.client.OpenFile(t.Context(), remotePCloudPath, nil)
+		if err != nil {
+			t.Fatalf("fichier %s introuvable sur pCloud après backup: %v", remotePCloudPath, err)
 		}
-	}()
-
-	if err := conn.Import(t.Context(), importRecords, nil); err != nil {
-		t.Fatalf("Import failed: %v", err)
-	}
-	<-doneImport
-
-	for _, d := range wantDirs {
-		if !gotDirs[d] {
-			t.Errorf("missing imported directory %s", d)
+		gotBytes, err := io.ReadAll(rd)
+		_ = rd.Close()
+		if err != nil {
+			t.Fatalf("lecture du fichier %s sur pCloud: %v", remotePCloudPath, err)
 		}
-	}
-	for p, want := range wantFiles {
-		if got, ok := gotFiles[p]; !ok {
-			t.Errorf("missing imported file %s", p)
-		} else if got != want {
-			t.Errorf("file %s content = %q, want %q", p, got, want)
+		if string(gotBytes) != wantContent {
+			t.Errorf("contenu sur pCloud pour %s = %q, attendu %q", remotePCloudPath, string(gotBytes), wantContent)
 		}
 	}
 }
