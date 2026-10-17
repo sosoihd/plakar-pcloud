@@ -1,0 +1,58 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Plakar pCloud Storage Connector Config",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "location"
+  ],
+  "properties": {
+    "location": {
+      "type": "string",
+      "minLength": 1,
+      "description": "pCloud location URI: pcloud://[us|eu|api.pcloud.com|eapi.pcloud.com][/path]"
+    },
+    "access_token": {
+      "type": "string",
+      "minLength": 1,
+      "description": "pCloud OAuth2 access token"
+    },
+    "auth": {
+      "type": "string",
+      "minLength": 1,
+      "description": "pCloud session auth token"
+    },
+    "username": {
+      "type": "string",
+      "minLength": 1,
+      "description": "pCloud account email/username (used with password for digest authentication)"
+    },
+    "password": {
+      "type": "string",
+      "minLength": 1,
+      "description": "pCloud account password (used with username for digest authentication)"
+    },
+    "region": {
+      "type": "string",
+      "enum": ["us", "eu"],
+      "default": "us",
+      "description": "pCloud data region: 'us' (api.pcloud.com) or 'eu' (eapi.pcloud.com)"
+    },
+    "root": {
+      "type": "string",
+      "default": "/",
+      "pattern": "^/",
+      "description": "Absolute path inside pCloud"
+    },
+    "endpoint": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Override pCloud API endpoint host (useful for testing/emulators)"
+    },
+    "insecure": {
+      "type": "boolean",
+      "default": false,
+      "description": "Use plain HTTP instead of HTTPS (useful for local testing)"
+    }
+  }
+}
