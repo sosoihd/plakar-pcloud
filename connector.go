@@ -101,6 +101,15 @@ func New(ctx context.Context, opts *connectors.Options, proto string, config map
 		return nil, fmt.Errorf("missing credentials: provide access_token, auth, or username and password")
 	}
 
+	debug := false
+	if v, ok := config["debug"]; ok && v != "" {
+		d, err := strconv.ParseBool(v)
+		if err != nil {
+			return nil, fmt.Errorf("invalid debug value %q: %w", v, err)
+		}
+		debug = d
+	}
+
 	client, err := NewClient(ClientConfig{
 		Scheme:      scheme,
 		Host:        host,
@@ -108,6 +117,7 @@ func New(ctx context.Context, opts *connectors.Options, proto string, config map
 		AuthToken:   authToken,
 		Username:    username,
 		Password:    password,
+		Debug:       debug,
 		HTTPClient:  httpClient,
 	})
 	if err != nil {

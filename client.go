@@ -29,6 +29,7 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/url"
+	"os"
 	"path"
 	"strings"
 	"sync"
@@ -62,10 +63,10 @@ func (e *APIError) Is(target error) bool {
 	switch target {
 	case fs.ErrNotExist:
 		// 2002: A component of parent directory does not exist
+		// 2005: Directory does not exist
 		// 2009: File not found
-		// 2010: Invalid path
 		// 2055: Directory does not exist
-		return e.Result == 2002 || e.Result == 2009 || e.Result == 2055
+		return e.Result == 2002 || e.Result == 2005 || e.Result == 2009 || e.Result == 2055
 	case fs.ErrExist:
 		// 2004: File or folder already exists
 		return e.Result == 2004
@@ -107,15 +108,36 @@ func (m *Metadata) ModTime() time.Time {
 }
 
 type baseResponse struct {
-	Result   int        `json:"result"`
-	Error    string     `json:"error"`
-	Digest   string     `json:"digest"`
-	Auth     string     `json:"auth"`
-	Metadata *Metadata  `json:"metadata"`
-	Hosts    []string   `json:"hosts"`
-	Path     string     `json:"path"`
-	FileIDs  []uint64   `json:"fileids"`
-	MetadataList []Metadata `json:"metadata_list,omitempty"`
+	Result   int             `json:"result"`
+	Error    string          `json:"error"`
+	Digest   string          `json:"digest"`
+	Auth     string          `json:"auth"`
+	Metadata json.RawMessage `json:"metadata,omitempty"`
+	Hosts    []string        `json:"hosts"`
+	Path     string          `json:"path"`
+	FileIDs  []uint64        `json:"fileids"`
+}
+
+func (r *baseResponse) parseMetadata() (*Metadata, error) {
+	if len(r.Metadata) == 0 || string(r.Metadata) == "null" {
+		return nil, nil
+	}
+	trimmed := bytes.TrimSpace(r.Metadata)
+	if len(trimmed) > 0 && trimmed[0] == '[' {
+		var list []Metadata
+		if err := json.Unmarshal(trimmed, &list); err != nil {
+			return nil, err
+		}
+		if len(list) == 0 {
+			return nil, nil
+		}
+		return &list[0], nil
+	}
+	var m Metadata
+	if err := json.Unmarshal(trimmed, &m); err != nil {
+		return nil, err
+	}
+	return &m, nil
 }
 
 // Client is an HTTP client for the pCloud API.
@@ -127,10 +149,11 @@ type Client struct {
 	authToken   string
 	username    string
 	password    string
+	debug       bool
 	httpClient  *http.Client
 
-	mu       sync.Mutex
-	ensured  map[string]struct{}
+	mu      sync.Mutex
+	ensured map[string]struct{}
 }
 
 // ClientConfig holds settings to initialize a pCloud Client.
@@ -141,6 +164,7 @@ type ClientConfig struct {
 	AuthToken   string
 	Username    string
 	Password    string
+	Debug       bool
 	HTTPClient  *http.Client
 }
 
@@ -159,9 +183,11 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 		transport.MaxIdleConnsPerHost = 64
 		httpClient = &http.Client{
 			Transport: transport,
-			Timeout:   0, // streaming transfers use context cancellation
+			Timeout:   5 * time.Minute,
 		}
 	}
+
+	debug := cfg.Debug || os.Getenv("PLAKAR_PCLOUD_DEBUG") != ""
 
 	return &Client{
 		baseURL:     fmt.Sprintf("%s://%s", scheme, host),
@@ -171,9 +197,17 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 		authToken:   cfg.AuthToken,
 		username:    cfg.Username,
 		password:    cfg.Password,
+		debug:       debug,
 		httpClient:  httpClient,
 		ensured:     make(map[string]struct{}),
 	}, nil
+}
+
+func (c *Client) logf(format string, args ...any) {
+	if !c.debug {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "[pcloud] "+format+"\n", args...)
 }
 
 func (c *Client) ensureAuth(ctx context.Context) error {
@@ -187,9 +221,11 @@ func (c *Client) ensureAuth(ctx context.Context) error {
 		return fmt.Errorf("pcloud: missing credentials (provide access_token, auth, or username and password)")
 	}
 
+	c.logf("authenticating user %s on %s via digest", c.username, c.host)
+
 	// Step 1: getdigest
 	var digestResp baseResponse
-	if err := c.doJSONUnlocked(ctx, http.MethodGet, "/getdigest", nil, nil, &digestResp, false); err != nil {
+	if err := c.doJSONUnlocked(ctx, http.MethodGet, "/getdigest", nil, nil, 0, &digestResp, false); err != nil {
 		return fmt.Errorf("pcloud getdigest: %w", err)
 	}
 	if digestResp.Digest == "" {
@@ -210,36 +246,38 @@ func (c *Client) ensureAuth(ctx context.Context) error {
 	q.Set("passworddigest", pwDigest)
 
 	var authResp baseResponse
-	if err := c.doJSONUnlocked(ctx, http.MethodGet, "/userinfo", q, nil, &authResp, false); err != nil {
+	if err := c.doJSONUnlocked(ctx, http.MethodGet, "/userinfo", q, nil, 0, &authResp, false); err != nil {
 		return fmt.Errorf("pcloud login failed: %w", err)
 	}
 	if authResp.Auth == "" {
 		return fmt.Errorf("pcloud login returned empty auth token")
 	}
 	c.authToken = authResp.Auth
+	c.logf("digest authentication succeeded")
 	return nil
 }
 
 func (c *Client) applyAuth(req *http.Request, q url.Values) {
 	if c.accessToken != "" {
 		req.Header.Set("Authorization", "Bearer "+c.accessToken)
+		q.Set("access_token", c.accessToken)
 	} else if c.authToken != "" {
 		q.Set("auth", c.authToken)
 	}
 }
 
-func (c *Client) doJSON(ctx context.Context, method, endpoint string, q url.Values, body io.Reader, contentType string, out *baseResponse) error {
+func (c *Client) doJSON(ctx context.Context, method, endpoint string, q url.Values, body io.Reader, contentLength int64, contentType string, out *baseResponse) error {
 	if err := c.ensureAuth(ctx); err != nil {
 		return err
 	}
-	return c.doJSONWithContentType(ctx, method, endpoint, q, body, contentType, out, true)
+	return c.doJSONWithContentType(ctx, method, endpoint, q, body, contentLength, contentType, out, true)
 }
 
-func (c *Client) doJSONUnlocked(ctx context.Context, method, endpoint string, q url.Values, body io.Reader, out *baseResponse, withAuth bool) error {
-	return c.doJSONWithContentType(ctx, method, endpoint, q, body, "", out, withAuth)
+func (c *Client) doJSONUnlocked(ctx context.Context, method, endpoint string, q url.Values, body io.Reader, contentLength int64, out *baseResponse, withAuth bool) error {
+	return c.doJSONWithContentType(ctx, method, endpoint, q, body, contentLength, "", out, withAuth)
 }
 
-func (c *Client) doJSONWithContentType(ctx context.Context, method, endpoint string, q url.Values, body io.Reader, contentType string, out *baseResponse, withAuth bool) error {
+func (c *Client) doJSONWithContentType(ctx context.Context, method, endpoint string, q url.Values, body io.Reader, contentLength int64, contentType string, out *baseResponse, withAuth bool) error {
 	if q == nil {
 		q = url.Values{}
 	}
@@ -248,9 +286,15 @@ func (c *Client) doJSONWithContentType(ctx context.Context, method, endpoint str
 		return err
 	}
 
+	start := time.Now()
+	c.logf("-> %s %s (path=%q)", method, endpoint, q.Get("path"))
+
 	req, err := http.NewRequestWithContext(ctx, method, u.String(), body)
 	if err != nil {
 		return err
+	}
+	if contentLength > 0 {
+		req.ContentLength = contentLength
 	}
 	req.Header.Set("User-Agent", UserAgent)
 	if contentType != "" {
@@ -263,6 +307,7 @@ func (c *Client) doJSONWithContentType(ctx context.Context, method, endpoint str
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
+		c.logf("<- %s %s error after %s: %v", method, endpoint, time.Since(start).Round(time.Millisecond), err)
 		return err
 	}
 	defer resp.Body.Close()
@@ -276,18 +321,20 @@ func (c *Client) doJSONWithContentType(ctx context.Context, method, endpoint str
 		return fmt.Errorf("pcloud decode response: %w", err)
 	}
 	if out.Result != 0 {
+		c.logf("<- %s %s api error %d (%s) in %s", method, endpoint, out.Result, out.Error, time.Since(start).Round(time.Millisecond))
 		return &APIError{
 			Result:  out.Result,
 			Message: out.Error,
 		}
 	}
+	c.logf("<- %s %s OK in %s", method, endpoint, time.Since(start).Round(time.Millisecond))
 	return nil
 }
 
 // Ping verifies connectivity and credentials against pCloud.
 func (c *Client) Ping(ctx context.Context) error {
 	var resp baseResponse
-	return c.doJSON(ctx, http.MethodGet, "/userinfo", nil, nil, "", &resp)
+	return c.doJSON(ctx, http.MethodGet, "/userinfo", nil, nil, 0, "", &resp)
 }
 
 // Stat returns metadata for a file or folder at remotePath.
@@ -300,12 +347,17 @@ func (c *Client) Stat(ctx context.Context, remotePath string) (*Metadata, error)
 	q.Set("path", remotePath)
 
 	var resp baseResponse
-	if err := c.doJSON(ctx, http.MethodGet, "/stat", q, nil, "", &resp); err == nil && resp.Metadata != nil {
-		return resp.Metadata, nil
-	} else if err != nil {
-		// Fallback to listfolder in case remotePath is a folder and /stat only checks files on some endpoints
+	if err := c.doJSON(ctx, http.MethodGet, "/stat", q, nil, 0, "", &resp); err == nil {
+		meta, perr := resp.parseMetadata()
+		if perr != nil {
+			return nil, perr
+		}
+		if meta != nil {
+			return meta, nil
+		}
+	} else {
 		var apiErr *APIError
-		if errors.As(err, &apiErr) && (apiErr.Result == 2009 || apiErr.Result == 2002 || apiErr.Result == 2055) {
+		if errors.As(err, &apiErr) && (apiErr.Result == 2009 || apiErr.Result == 2002 || apiErr.Result == 2005 || apiErr.Result == 2055) {
 			if folderMeta, ferr := c.ListFolder(ctx, remotePath, false); ferr == nil {
 				return folderMeta, nil
 			}
@@ -325,13 +377,17 @@ func (c *Client) ListFolder(ctx context.Context, remotePath string, recursive bo
 	}
 
 	var resp baseResponse
-	if err := c.doJSON(ctx, http.MethodGet, "/listfolder", q, nil, "", &resp); err != nil {
+	if err := c.doJSON(ctx, http.MethodGet, "/listfolder", q, nil, 0, "", &resp); err != nil {
 		return nil, err
 	}
-	if resp.Metadata == nil {
+	meta, err := resp.parseMetadata()
+	if err != nil {
+		return nil, err
+	}
+	if meta == nil {
 		return nil, ErrNotFound
 	}
-	return resp.Metadata, nil
+	return meta, nil
 }
 
 // CreateFolder creates a single directory at remotePath, failing if it already exists.
@@ -341,10 +397,10 @@ func (c *Client) CreateFolder(ctx context.Context, remotePath string) (*Metadata
 	q.Set("path", remotePath)
 
 	var resp baseResponse
-	if err := c.doJSON(ctx, http.MethodPost, "/createfolder", q, nil, "", &resp); err != nil {
+	if err := c.doJSON(ctx, http.MethodGet, "/createfolder", q, nil, 0, "", &resp); err != nil {
 		return nil, err
 	}
-	return resp.Metadata, nil
+	return resp.parseMetadata()
 }
 
 // CreateFolderIfNotExists creates a single directory at remotePath if it does not exist.
@@ -365,7 +421,7 @@ func (c *Client) CreateFolderIfNotExists(ctx context.Context, remotePath string)
 	q.Set("path", remotePath)
 
 	var resp baseResponse
-	if err := c.doJSON(ctx, http.MethodPost, "/createfolderifnotexists", q, nil, "", &resp); err != nil {
+	if err := c.doJSON(ctx, http.MethodGet, "/createfolderifnotexists", q, nil, 0, "", &resp); err != nil {
 		return nil, err
 	}
 
@@ -373,7 +429,7 @@ func (c *Client) CreateFolderIfNotExists(ctx context.Context, remotePath string)
 	c.ensured[remotePath] = struct{}{}
 	c.mu.Unlock()
 
-	return resp.Metadata, nil
+	return resp.parseMetadata()
 }
 
 // MkdirAll ensures all directory components of remotePath exist.
@@ -398,6 +454,9 @@ func (c *Client) MkdirAll(ctx context.Context, remotePath string) error {
 }
 
 // UploadFile uploads a file to remotePath, creating parent directories if needed.
+// Note: pCloud's HTTP server (CloudHTTPd-API v1.1) requires an explicit Content-Length
+// header and hangs if Transfer-Encoding: chunked is sent, so we assemble the multipart
+// payload with a known size before sending.
 func (c *Client) UploadFile(ctx context.Context, remotePath string, rd io.Reader) (int64, error) {
 	remotePath = cleanRemotePath(remotePath)
 	dir := path.Dir(remotePath)
@@ -410,28 +469,19 @@ func (c *Client) UploadFile(ctx context.Context, remotePath string, rd io.Reader
 		return 0, fmt.Errorf("pcloud mkdir parent %s: %w", dir, err)
 	}
 
-	pr, pw := io.Pipe()
-	mw := multipart.NewWriter(pw)
-
-	var written int64
-	go func() {
-		part, err := mw.CreateFormFile("file", filename)
-		if err != nil {
-			_ = pw.CloseWithError(err)
-			return
-		}
-		n, err := io.Copy(part, rd)
-		written = n
-		if err != nil {
-			_ = pw.CloseWithError(err)
-			return
-		}
-		if err := mw.Close(); err != nil {
-			_ = pw.CloseWithError(err)
-			return
-		}
-		_ = pw.Close()
-	}()
+	var bodyBuf bytes.Buffer
+	mw := multipart.NewWriter(&bodyBuf)
+	part, err := mw.CreateFormFile("file", filename)
+	if err != nil {
+		return 0, err
+	}
+	written, err := io.Copy(part, rd)
+	if err != nil {
+		return 0, err
+	}
+	if err := mw.Close(); err != nil {
+		return 0, err
+	}
 
 	q := url.Values{}
 	q.Set("path", dir)
@@ -439,8 +489,8 @@ func (c *Client) UploadFile(ctx context.Context, remotePath string, rd io.Reader
 	q.Set("nopartial", "1")
 
 	var resp baseResponse
-	if err := c.doJSON(ctx, http.MethodPost, "/uploadfile", q, pr, mw.FormDataContentType(), &resp); err != nil {
-		_ = pr.Close()
+	contentLen := int64(bodyBuf.Len())
+	if err := c.doJSON(ctx, http.MethodPost, "/uploadfile", q, &bodyBuf, contentLen, mw.FormDataContentType(), &resp); err != nil {
 		return 0, err
 	}
 	return written, nil
@@ -457,7 +507,7 @@ func (c *Client) OpenFile(ctx context.Context, remotePath string, rg *storage.Ra
 	q.Set("path", remotePath)
 
 	var linkResp baseResponse
-	if err := c.doJSON(ctx, http.MethodGet, "/getfilelink", q, nil, "", &linkResp); err != nil {
+	if err := c.doJSON(ctx, http.MethodGet, "/getfilelink", q, nil, 0, "", &linkResp); err != nil {
 		return nil, err
 	}
 	if len(linkResp.Hosts) == 0 || linkResp.Path == "" {
@@ -491,8 +541,6 @@ func (c *Client) OpenFile(ctx context.Context, remotePath string, rg *storage.Ra
 		return nil, fmt.Errorf("pcloud download status %d: %s", resp.StatusCode, strings.TrimSpace(string(msg)))
 	}
 
-	// If server ignored the Range header and returned 200 OK instead of 206 Partial Content,
-	// slice the stream locally so callers always receive the requested byte range.
 	if rg != nil && resp.StatusCode == http.StatusOK {
 		if _, err := io.CopyN(io.Discard, resp.Body, int64(rg.Offset)); err != nil {
 			resp.Body.Close()
@@ -522,7 +570,7 @@ func (c *Client) DeleteFile(ctx context.Context, remotePath string) error {
 	q.Set("path", remotePath)
 
 	var resp baseResponse
-	return c.doJSON(ctx, http.MethodPost, "/deletefile", q, nil, "", &resp)
+	return c.doJSON(ctx, http.MethodGet, "/deletefile", q, nil, 0, "", &resp)
 }
 
 // DeleteFolderRecursive deletes a folder and its contents at remotePath.
@@ -536,7 +584,7 @@ func (c *Client) DeleteFolderRecursive(ctx context.Context, remotePath string) e
 	c.mu.Unlock()
 
 	var resp baseResponse
-	return c.doJSON(ctx, http.MethodPost, "/deletefolderrecursive", q, nil, "", &resp)
+	return c.doJSON(ctx, http.MethodGet, "/deletefolderrecursive", q, nil, 0, "", &resp)
 }
 
 func cleanRemotePath(p string) string {

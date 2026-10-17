@@ -160,6 +160,10 @@ func (s *fakePCloudServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(v)
 	}
+	rawMeta := func(v any) json.RawMessage {
+		b, _ := json.Marshal(v)
+		return b
+	}
 
 	switch r.URL.Path {
 	case "/getdigest":
@@ -232,7 +236,7 @@ func (s *fakePCloudServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			writeJSON(baseResponse{Result: 2009, Error: "File not found."})
 			return
 		}
-		writeJSON(baseResponse{Result: 0, Metadata: meta})
+		writeJSON(baseResponse{Result: 0, Metadata: rawMeta(meta)})
 
 	case "/listfolder":
 		p := cleanRemotePath(q.Get("path"))
@@ -244,7 +248,7 @@ func (s *fakePCloudServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			writeJSON(baseResponse{Result: 2005, Error: "Directory does not exist."})
 			return
 		}
-		writeJSON(baseResponse{Result: 0, Metadata: meta})
+		writeJSON(baseResponse{Result: 0, Metadata: rawMeta(meta)})
 
 	case "/createfolderifnotexists", "/createfolder":
 		p := cleanRemotePath(q.Get("path"))
@@ -260,7 +264,7 @@ func (s *fakePCloudServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		meta, _ := s.buildMetadataLocked(p, false)
 		s.mu.Unlock()
-		writeJSON(baseResponse{Result: 0, Metadata: meta})
+		writeJSON(baseResponse{Result: 0, Metadata: rawMeta(meta)})
 
 	case "/uploadfile":
 		dir := cleanRemotePath(q.Get("path"))
@@ -295,8 +299,9 @@ func (s *fakePCloudServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			data:     content,
 			modTime:  time.Now(),
 		}
+		meta, _ := s.buildMetadataLocked(fullPath, false)
 		s.mu.Unlock()
-		writeJSON(baseResponse{Result: 0})
+		writeJSON(baseResponse{Result: 0, Metadata: rawMeta([]*Metadata{meta})})
 
 	case "/getfilelink":
 		p := cleanRemotePath(q.Get("path"))

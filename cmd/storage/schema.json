@@ -53,6 +53,11 @@
       "type": "boolean",
       "default": false,
       "description": "Use plain HTTP instead of HTTPS (useful for local testing)"
+    },
+    "debug": {
+      "type": "boolean",
+      "default": false,
+      "description": "Enable verbose debug logging to stderr"
     }
   }
 }
