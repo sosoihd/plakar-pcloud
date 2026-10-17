@@ -5,3 +5,4 @@ pcloud-exporter.exe
 pcloud-storage
 pcloud-storage.exe
 *.ptar
+coverage.out
