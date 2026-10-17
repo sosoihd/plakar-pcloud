@@ -46,7 +46,7 @@ import (
 const (
 	DefaultHostUS = "api.pcloud.com"
 	DefaultHostEU = "eapi.pcloud.com"
-	UserAgent     = "plakar-pcloud/1.0.0"
+	UserAgent     = "plakar-pcloud/1.1.0"
 
 	defaultMaxRetries     = 5
 	defaultRetryBaseDelay = 250 * time.Millisecond

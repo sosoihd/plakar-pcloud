@@ -31,8 +31,8 @@ Or step by step:
 
 ```bash
 make build                                         # compile the 3 executables
-make package                                       # create pcloud_v1.0.0_<os>_<arch>.ptar
-plakar pkg add -allow-unsigned ./pcloud_v1.0.0_*.ptar
+make package                                       # create pcloud_v1.1.0_<os>_<arch>.ptar
+plakar pkg add -allow-unsigned ./pcloud_v1.1.0_*.ptar
 plakar pkg show
 ```
 
