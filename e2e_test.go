@@ -20,6 +20,7 @@ import (
 	"bytes"
 	"io"
 	"math/rand/v2"
+	"os"
 	"path"
 	"testing"
 
@@ -38,11 +39,20 @@ import (
 
 func newKContext(t *testing.T) *kcontext.KContext {
 	t.Helper()
+	// Kloset keeps its SQLite state cache open after Repository.Close, and
+	// Windows refuses to delete open files, so t.TempDir's strict cleanup
+	// would fail the test. Remove the directory on a best-effort basis.
+	cacheDir, err := os.MkdirTemp("", "plakar-pcloud-e2e-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(cacheDir) })
+
 	ctx := kcontext.NewKContext()
 	ctx.Client = "plakar-pcloud-test/1.0.0"
 	ctx.MaxConcurrency = 2
 	ctx.SetCache(caching.NewManager(memCacheConstructor()))
-	ctx.CacheDir = t.TempDir()
+	ctx.CacheDir = cacheDir
 	ctx.SetLogger(logging.NewLogger(io.Discard, io.Discard))
 	t.Cleanup(ctx.Close)
 	return ctx
