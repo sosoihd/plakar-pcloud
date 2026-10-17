@@ -19,12 +19,15 @@ package pcloud
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"io/fs"
+	"os"
 	"path"
+	"path/filepath"
 
 	"github.com/PlakarKorp/kloset/connectors/storage"
 	"github.com/PlakarKorp/kloset/objects"
@@ -63,6 +66,73 @@ func (c *Connector) objectPath(res storage.StorageResource, mac objects.MAC) (st
 		return c.storePath(prefix, fmt.Sprintf("%02x", mac[0]), macHex), nil
 	}
 	return c.storePath(prefix, macHex), nil
+}
+
+func (c *Connector) localCachePath(res storage.StorageResource, mac objects.MAC) (string, bool) {
+	switch res {
+	case storage.StorageResourcePackfile, storage.StorageResourceState,
+		storage.StorageResourceECCPackfile, storage.StorageResourceECCState:
+	default:
+		return "", false
+	}
+
+	prefix, _, err := resToPrefix(res)
+	if err != nil {
+		return "", false
+	}
+
+	baseDir, err := os.UserCacheDir()
+	if err != nil || baseDir == "" {
+		baseDir = os.TempDir()
+	}
+	storeHash := sha256.Sum256([]byte(c.host + ":" + c.rootDir))
+	storeID := hex.EncodeToString(storeHash[:8])
+	macHex := fmt.Sprintf("%064x", mac)
+
+	return filepath.Join(baseDir, "plakar-pcloud", storeID, prefix, fmt.Sprintf("%02x", mac[0]), macHex), true
+}
+
+func writeCacheFileAtomic(cachePath string, data []byte) {
+	if err := os.MkdirAll(filepath.Dir(cachePath), 0700); err != nil {
+		return
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(cachePath), ".tmp-*")
+	if err != nil {
+		return
+	}
+	tmpName := tmp.Name()
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
+		return
+	}
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(tmpName)
+		return
+	}
+	_ = os.Rename(tmpName, cachePath)
+}
+
+func openCachedFileRange(cachePath string, rg *storage.Range) (io.ReadCloser, error) {
+	f, err := os.Open(cachePath)
+	if err != nil {
+		return nil, err
+	}
+	if rg == nil {
+		return f, nil
+	}
+	if rg.Length == 0 {
+		_ = f.Close()
+		return io.NopCloser(bytes.NewReader(nil)), nil
+	}
+	if _, err := f.Seek(int64(rg.Offset), io.SeekStart); err != nil {
+		_ = f.Close()
+		return nil, err
+	}
+	return &limitedReadCloser{
+		Reader: io.LimitReader(f, int64(rg.Length)),
+		Closer: f,
+	}, nil
 }
 
 func (c *Connector) Mode(ctx context.Context) (storage.Mode, error) {
@@ -166,7 +236,22 @@ func (c *Connector) Put(ctx context.Context, res storage.StorageResource, mac ob
 	if err != nil {
 		return -1, err
 	}
-	return c.client.UploadFile(ctx, objPath, rd)
+
+	data, err := io.ReadAll(rd)
+	if err != nil {
+		return -1, err
+	}
+
+	n, err := c.client.UploadFile(ctx, objPath, bytes.NewReader(data))
+	if err != nil {
+		return 0, err
+	}
+
+	if cachePath, ok := c.localCachePath(res, mac); ok {
+		writeCacheFileAtomic(cachePath, data)
+	}
+
+	return n, nil
 }
 
 func (c *Connector) Get(ctx context.Context, res storage.StorageResource, mac objects.MAC, rg *storage.Range) (io.ReadCloser, error) {
@@ -174,6 +259,42 @@ func (c *Connector) Get(ctx context.Context, res storage.StorageResource, mac ob
 	if err != nil {
 		return nil, err
 	}
+
+	if cachePath, ok := c.localCachePath(res, mac); ok {
+		if rd, err := openCachedFileRange(cachePath, rg); err == nil {
+			return rd, nil
+		}
+
+		// Download immutable packfile/state once and cache on disk so all subsequent
+		// B-tree range reads (e.g. during `plakar ui` or `plakar ls`) are instantaneous.
+		_, err, _ := c.sf.Do(cachePath, func() (any, error) {
+			if _, statErr := os.Stat(cachePath); statErr == nil {
+				return nil, nil
+			}
+			remoteRd, dlErr := c.client.OpenFile(ctx, objPath, nil)
+			if dlErr != nil {
+				return nil, dlErr
+			}
+			defer remoteRd.Close()
+			data, readErr := io.ReadAll(remoteRd)
+			if readErr != nil {
+				return nil, readErr
+			}
+			writeCacheFileAtomic(cachePath, data)
+			return nil, nil
+		})
+		if err != nil {
+			if errors.Is(err, fs.ErrNotExist) && res == storage.StorageResourcePackfile {
+				return nil, repository.ErrPackfileNotFound
+			}
+			return nil, err
+		}
+
+		if rd, err := openCachedFileRange(cachePath, rg); err == nil {
+			return rd, nil
+		}
+	}
+
 	rd, err := c.client.OpenFile(ctx, objPath, rg)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) && res == storage.StorageResourcePackfile {
@@ -185,6 +306,10 @@ func (c *Connector) Get(ctx context.Context, res storage.StorageResource, mac ob
 }
 
 func (c *Connector) Delete(ctx context.Context, res storage.StorageResource, mac objects.MAC) error {
+	if cachePath, ok := c.localCachePath(res, mac); ok {
+		_ = os.Remove(cachePath)
+	}
+
 	objPath, err := c.objectPath(res, mac)
 	if err != nil {
 		return err

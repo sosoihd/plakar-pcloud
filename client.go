@@ -20,6 +20,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha1"
+	"crypto/tls"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -27,6 +28,7 @@ import (
 	"io"
 	"io/fs"
 	"mime/multipart"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -42,6 +44,7 @@ const (
 	DefaultHostUS = "api.pcloud.com"
 	DefaultHostEU = "eapi.pcloud.com"
 	UserAgent     = "plakar-pcloud/1.0.0"
+	linkCacheTTL  = 30 * time.Minute
 )
 
 var (
@@ -140,6 +143,11 @@ func (r *baseResponse) parseMetadata() (*Metadata, error) {
 	return &m, nil
 }
 
+type cachedLink struct {
+	url       string
+	expiresAt time.Time
+}
+
 // Client is an HTTP client for the pCloud API.
 type Client struct {
 	baseURL     string
@@ -154,6 +162,7 @@ type Client struct {
 
 	mu      sync.Mutex
 	ensured map[string]struct{}
+	links   map[string]cachedLink
 }
 
 // ClientConfig holds settings to initialize a pCloud Client.
@@ -180,7 +189,17 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 	httpClient := cfg.HTTPClient
 	if httpClient == nil {
 		transport := http.DefaultTransport.(*http.Transport).Clone()
+		transport.MaxIdleConns = 128
 		transport.MaxIdleConnsPerHost = 64
+		transport.DialContext = (&net.Dialer{
+			Timeout:   5 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext
+		// Enable TLS session resumption so reconnects to eapi.pcloud.com (which sends Connection: close)
+		// use 1-RTT TLS 1.3 session tickets instead of full handshakes.
+		transport.TLSClientConfig = &tls.Config{
+			ClientSessionCache: tls.NewLRUClientSessionCache(256),
+		}
 		httpClient = &http.Client{
 			Transport: transport,
 			Timeout:   5 * time.Minute,
@@ -200,6 +219,7 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 		debug:       debug,
 		httpClient:  httpClient,
 		ensured:     make(map[string]struct{}),
+		links:       make(map[string]cachedLink),
 	}, nil
 }
 
@@ -454,9 +474,6 @@ func (c *Client) MkdirAll(ctx context.Context, remotePath string) error {
 }
 
 // UploadFile uploads a file to remotePath, creating parent directories if needed.
-// Note: pCloud's HTTP server (CloudHTTPd-API v1.1) requires an explicit Content-Length
-// header and hangs if Transfer-Encoding: chunked is sent, so we assemble the multipart
-// payload with a known size before sending.
 func (c *Client) UploadFile(ctx context.Context, remotePath string, rd io.Reader) (int64, error) {
 	remotePath = cleanRemotePath(remotePath)
 	dir := path.Dir(remotePath)
@@ -493,7 +510,43 @@ func (c *Client) UploadFile(ctx context.Context, remotePath string, rd io.Reader
 	if err := c.doJSON(ctx, http.MethodPost, "/uploadfile", q, &bodyBuf, contentLen, mw.FormDataContentType(), &resp); err != nil {
 		return 0, err
 	}
+
+	c.mu.Lock()
+	delete(c.links, remotePath)
+	c.mu.Unlock()
+
 	return written, nil
+}
+
+func (c *Client) resolveDownloadURL(ctx context.Context, remotePath string, forceRefresh bool) (string, error) {
+	if !forceRefresh {
+		c.mu.Lock()
+		if entry, ok := c.links[remotePath]; ok && time.Now().Before(entry.expiresAt) {
+			c.mu.Unlock()
+			return entry.url, nil
+		}
+		c.mu.Unlock()
+	}
+
+	q := url.Values{}
+	q.Set("path", remotePath)
+
+	var linkResp baseResponse
+	if err := c.doJSON(ctx, http.MethodGet, "/getfilelink", q, nil, 0, "", &linkResp); err != nil {
+		return "", err
+	}
+	if len(linkResp.Hosts) == 0 || linkResp.Path == "" {
+		return "", fmt.Errorf("pcloud getfilelink returned empty download link for %s", remotePath)
+	}
+
+	dlURL := fmt.Sprintf("%s://%s%s", c.scheme, linkResp.Hosts[0], linkResp.Path)
+	c.mu.Lock()
+	c.links[remotePath] = cachedLink{
+		url:       dlURL,
+		expiresAt: time.Now().Add(linkCacheTTL),
+	}
+	c.mu.Unlock()
+	return dlURL, nil
 }
 
 // OpenFile opens a file at remotePath for reading, optionally restricted to a byte range.
@@ -503,32 +556,27 @@ func (c *Client) OpenFile(ctx context.Context, remotePath string, rg *storage.Ra
 		return io.NopCloser(bytes.NewReader(nil)), nil
 	}
 
-	q := url.Values{}
-	q.Set("path", remotePath)
-
-	var linkResp baseResponse
-	if err := c.doJSON(ctx, http.MethodGet, "/getfilelink", q, nil, 0, "", &linkResp); err != nil {
-		return nil, err
-	}
-	if len(linkResp.Hosts) == 0 || linkResp.Path == "" {
-		return nil, fmt.Errorf("pcloud getfilelink returned empty download link for %s", remotePath)
-	}
-
-	dlURL := fmt.Sprintf("%s://%s%s", c.scheme, linkResp.Hosts[0], linkResp.Path)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, dlURL, nil)
+	dlURL, err := c.resolveDownloadURL(ctx, remotePath, false)
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("User-Agent", UserAgent)
 
-	if rg != nil {
-		end := rg.Offset + uint64(rg.Length) - 1
-		req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", rg.Offset, end))
-	}
-
-	resp, err := c.httpClient.Do(req)
+	resp, err := c.doDownload(ctx, dlURL, rg)
 	if err != nil {
 		return nil, err
+	}
+
+	// If cached download link expired (401/403/410), refresh once.
+	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusGone {
+		resp.Body.Close()
+		dlURL, err = c.resolveDownloadURL(ctx, remotePath, true)
+		if err != nil {
+			return nil, err
+		}
+		resp, err = c.doDownload(ctx, dlURL, rg)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	if resp.StatusCode == http.StatusNotFound {
@@ -558,6 +606,21 @@ func (c *Client) OpenFile(ctx context.Context, remotePath string, rg *storage.Ra
 	return resp.Body, nil
 }
 
+func (c *Client) doDownload(ctx context.Context, dlURL string, rg *storage.Range) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, dlURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", UserAgent)
+
+	if rg != nil {
+		end := rg.Offset + uint64(rg.Length) - 1
+		req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", rg.Offset, end))
+	}
+
+	return c.httpClient.Do(req)
+}
+
 type limitedReadCloser struct {
 	io.Reader
 	io.Closer
@@ -568,6 +631,10 @@ func (c *Client) DeleteFile(ctx context.Context, remotePath string) error {
 	remotePath = cleanRemotePath(remotePath)
 	q := url.Values{}
 	q.Set("path", remotePath)
+
+	c.mu.Lock()
+	delete(c.links, remotePath)
+	c.mu.Unlock()
 
 	var resp baseResponse
 	return c.doJSON(ctx, http.MethodGet, "/deletefile", q, nil, 0, "", &resp)

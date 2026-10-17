@@ -31,6 +31,7 @@ import (
 	"github.com/PlakarKorp/kloset/connectors/storage"
 	"github.com/PlakarKorp/kloset/exclude"
 	"github.com/PlakarKorp/kloset/location"
+	"golang.org/x/sync/singleflight"
 )
 
 func init() {
@@ -46,6 +47,7 @@ type Connector struct {
 	rootDir        string
 	maxConcurrency int
 	excludes       *exclude.RuleSet
+	sf             singleflight.Group
 }
 
 func New(ctx context.Context, opts *connectors.Options, proto string, config map[string]string, httpClient *http.Client) (*Connector, error) {
