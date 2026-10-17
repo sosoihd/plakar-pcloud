@@ -31,8 +31,10 @@ import (
 	"github.com/PlakarKorp/kloset/connectors/storage"
 	"github.com/PlakarKorp/kloset/exclude"
 	"github.com/PlakarKorp/kloset/location"
-	"golang.org/x/sync/singleflight"
+	"github.com/dustin/go-humanize"
 )
+
+const defaultCacheSize = 256 << 20
 
 func init() {
 	importer.Register("pcloud", 0, NewImporter)
@@ -47,7 +49,7 @@ type Connector struct {
 	rootDir        string
 	maxConcurrency int
 	excludes       *exclude.RuleSet
-	sf             singleflight.Group
+	cache          *blockCache
 }
 
 func New(ctx context.Context, opts *connectors.Options, proto string, config map[string]string, httpClient *http.Client) (*Connector, error) {
@@ -59,21 +61,24 @@ func New(ctx context.Context, opts *connectors.Options, proto string, config map
 	if !ok || strings.TrimSpace(rawLoc) == "" {
 		return nil, fmt.Errorf("missing location")
 	}
-
 	u, err := url.Parse(rawLoc)
 	if err != nil {
-		return nil, fmt.Errorf("failed to parse location %q: %w", rawLoc, err)
+		return nil, fmt.Errorf("failed to parse location: %w", err)
+	}
+	if u.Scheme != "pcloud" {
+		return nil, fmt.Errorf("invalid location scheme %q: expected pcloud://", u.Scheme)
+	}
+	if u.User != nil {
+		return nil, fmt.Errorf("credentials must not be embedded in the location: use the username/password or access_token parameters")
 	}
 
-	scheme := "https"
-	if v, ok := config["insecure"]; ok && v != "" {
-		insecure, err := strconv.ParseBool(v)
-		if err != nil {
-			return nil, fmt.Errorf("invalid insecure value %q: %w", v, err)
-		}
-		if insecure {
-			scheme = "http"
-		}
+	insecure, err := parseBool(config, "insecure")
+	if err != nil {
+		return nil, err
+	}
+	debug, err := parseBool(config, "debug")
+	if err != nil {
+		return nil, err
 	}
 
 	region := strings.ToLower(strings.TrimSpace(config["region"]))
@@ -84,32 +89,28 @@ func New(ctx context.Context, opts *connectors.Options, proto string, config map
 		return nil, err
 	}
 
+	scheme := "https"
+	if insecure {
+		if endpoint == "" {
+			return nil, fmt.Errorf("insecure=true is only allowed together with a custom endpoint: credentials are never sent to pCloud in clear text")
+		}
+		scheme = "http"
+	}
+
 	accessToken := strings.TrimSpace(config["access_token"])
 	authToken := strings.TrimSpace(config["auth"])
 	username := strings.TrimSpace(config["username"])
 	password := config["password"]
-
-	if u.User != nil {
-		if username != "" {
-			return nil, fmt.Errorf("cannot specify both user@host in location and username parameter")
-		}
-		username = u.User.Username()
-		if pw, hasPw := u.User.Password(); hasPw && password == "" {
-			password = pw
-		}
-	}
-
 	if accessToken == "" && authToken == "" && (username == "" || password == "") {
 		return nil, fmt.Errorf("missing credentials: provide access_token, auth, or username and password")
 	}
 
-	debug := false
-	if v, ok := config["debug"]; ok && v != "" {
-		d, err := strconv.ParseBool(v)
+	cacheSize := uint64(defaultCacheSize)
+	if v, ok := config["cache_size"]; ok && strings.TrimSpace(v) != "" {
+		cacheSize, err = humanize.ParseBytes(v)
 		if err != nil {
-			return nil, fmt.Errorf("invalid debug value %q: %w", v, err)
+			return nil, fmt.Errorf("invalid cache_size %q: %w", v, err)
 		}
-		debug = d
 	}
 
 	client, err := NewClient(ClientConfig{
@@ -145,9 +146,27 @@ func New(ctx context.Context, opts *connectors.Options, proto string, config map
 		rootDir:        rootDir,
 		maxConcurrency: maxConcurrency,
 		excludes:       excludes,
+		cache:          newBlockCache(int64(min(cacheSize, 1<<40))),
 	}, nil
 }
 
+func parseBool(config map[string]string, key string) (bool, error) {
+	v, ok := config[key]
+	if !ok || v == "" {
+		return false, nil
+	}
+	b, err := strconv.ParseBool(v)
+	if err != nil {
+		return false, fmt.Errorf("invalid %s value %q: %w", key, v, err)
+	}
+	return b, nil
+}
+
+// resolveHostAndRoot derives the API host and the root folder. Only the
+// official pCloud hosts (or their us/eu aliases) are recognized in the
+// location; any other "host" is the first folder of the path. A custom API
+// host can only be set explicitly through the endpoint parameter, so a
+// folder name can never redirect credentials to a third-party server.
 func resolveHostAndRoot(u *url.URL, region, endpoint, explicitRoot string) (string, string, error) {
 	var host string
 	switch region {
@@ -167,26 +186,26 @@ func resolveHostAndRoot(u *url.URL, region, endpoint, explicitRoot string) (stri
 		case "eu", DefaultHostEU:
 			host = DefaultHostEU
 		default:
-			if strings.Contains(u.Host, ".") || strings.Contains(u.Host, ":") || u.Host == "localhost" {
-				host = u.Host
-			} else {
-				// Treat pcloud://Folder/Subfolder as path /Folder/Subfolder
-				urlPath = path.Join("/", u.Host, u.Path)
-			}
+			urlPath = path.Join("/", u.Host, u.Path)
 		}
 	}
 
 	if endpoint != "" {
-		host = strings.TrimPrefix(strings.TrimPrefix(endpoint, "https://"), "http://")
-		host = strings.TrimSuffix(host, "/")
+		eu, err := url.Parse(endpoint)
+		if err != nil || eu.Host == "" {
+			eu, err = url.Parse("//" + endpoint)
+		}
+		if err != nil || eu.Host == "" || (eu.Path != "" && eu.Path != "/") || eu.User != nil {
+			return "", "", fmt.Errorf("invalid endpoint %q: expected host[:port]", endpoint)
+		}
+		host = eu.Host
 	}
 
 	rootDir := urlPath
 	if explicitRoot != "" {
 		rootDir = explicitRoot
 	}
-	rootDir = cleanRemotePath(rootDir)
-	return host, rootDir, nil
+	return host, cleanRemotePath(rootDir), nil
 }
 
 func NewImporter(ctx context.Context, opts *connectors.Options, proto string, config map[string]string) (importer.Importer, error) {
@@ -211,7 +230,8 @@ func (c *Connector) Ping(ctx context.Context) error {
 }
 
 func (c *Connector) Close(ctx context.Context) error {
-	return nil
+	c.cache.purge()
+	return c.client.Close(ctx)
 }
 
 // isContained reports whether joined is rooted within root, guarding against

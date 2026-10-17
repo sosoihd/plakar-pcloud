@@ -19,20 +19,20 @@ package pcloud
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"io/fs"
-	"os"
 	"path"
-	"path/filepath"
 
 	"github.com/PlakarKorp/kloset/connectors/storage"
 	"github.com/PlakarKorp/kloset/objects"
 	"github.com/PlakarKorp/kloset/repository"
 )
+
+// maxConfigSize bounds the CONFIG file read by Open.
+const maxConfigSize = 1 << 20
 
 func (c *Connector) storePath(parts ...string) string {
 	all := append([]string{c.rootDir}, parts...)
@@ -61,78 +61,17 @@ func (c *Connector) objectPath(res storage.StorageResource, mac objects.MAC) (st
 	if err != nil {
 		return "", err
 	}
-	macHex := fmt.Sprintf("%064x", mac)
+	macHex := hex.EncodeToString(mac[:])
 	if bucketed {
-		return c.storePath(prefix, fmt.Sprintf("%02x", mac[0]), macHex), nil
+		return c.storePath(prefix, macHex[:2], macHex), nil
 	}
 	return c.storePath(prefix, macHex), nil
 }
 
-func (c *Connector) localCachePath(res storage.StorageResource, mac objects.MAC) (string, bool) {
-	switch res {
-	case storage.StorageResourcePackfile, storage.StorageResourceState,
-		storage.StorageResourceECCPackfile, storage.StorageResourceECCState:
-	default:
-		return "", false
-	}
-
-	prefix, _, err := resToPrefix(res)
-	if err != nil {
-		return "", false
-	}
-
-	baseDir, err := os.UserCacheDir()
-	if err != nil || baseDir == "" {
-		baseDir = os.TempDir()
-	}
-	storeHash := sha256.Sum256([]byte(c.host + ":" + c.rootDir))
-	storeID := hex.EncodeToString(storeHash[:8])
-	macHex := fmt.Sprintf("%064x", mac)
-
-	return filepath.Join(baseDir, "plakar-pcloud", storeID, prefix, fmt.Sprintf("%02x", mac[0]), macHex), true
-}
-
-func writeCacheFileAtomic(cachePath string, data []byte) {
-	if err := os.MkdirAll(filepath.Dir(cachePath), 0700); err != nil {
-		return
-	}
-	tmp, err := os.CreateTemp(filepath.Dir(cachePath), ".tmp-*")
-	if err != nil {
-		return
-	}
-	tmpName := tmp.Name()
-	if _, err := tmp.Write(data); err != nil {
-		_ = tmp.Close()
-		_ = os.Remove(tmpName)
-		return
-	}
-	if err := tmp.Close(); err != nil {
-		_ = os.Remove(tmpName)
-		return
-	}
-	_ = os.Rename(tmpName, cachePath)
-}
-
-func openCachedFileRange(cachePath string, rg *storage.Range) (io.ReadCloser, error) {
-	f, err := os.Open(cachePath)
-	if err != nil {
-		return nil, err
-	}
-	if rg == nil {
-		return f, nil
-	}
-	if rg.Length == 0 {
-		_ = f.Close()
-		return io.NopCloser(bytes.NewReader(nil)), nil
-	}
-	if _, err := f.Seek(int64(rg.Offset), io.SeekStart); err != nil {
-		_ = f.Close()
-		return nil, err
-	}
-	return &limitedReadCloser{
-		Reader: io.LimitReader(f, int64(rg.Length)),
-		Closer: f,
-	}, nil
+// isCacheable reports whether ranged reads of res may be served from the
+// in-memory block cache. Only immutable, randomly accessed objects qualify.
+func isCacheable(res storage.StorageResource) bool {
+	return res == storage.StorageResourcePackfile || res == storage.StorageResourceECCPackfile
 }
 
 func (c *Connector) Mode(ctx context.Context) (storage.Mode, error) {
@@ -157,22 +96,25 @@ func (c *Connector) Create(ctx context.Context, config []byte) error {
 		}
 	}
 
-	if _, err := c.client.UploadFile(ctx, cfgPath, bytes.NewReader(config)); err != nil {
+	if _, err := c.client.UploadBytes(ctx, cfgPath, config, UploadOptions{}); err != nil {
 		return fmt.Errorf("pcloud write CONFIG: %w", err)
 	}
 	return nil
 }
 
 func (c *Connector) Open(ctx context.Context) ([]byte, error) {
-	rd, err := c.client.OpenFile(ctx, c.storePath("CONFIG"), nil)
+	rd, err := c.client.OpenFile(ctx, c.storePath("CONFIG"), 0, -1)
 	if err != nil {
 		return nil, fmt.Errorf("pcloud open CONFIG: %w", err)
 	}
 	defer rd.Close()
 
-	data, err := io.ReadAll(rd)
+	data, err := io.ReadAll(io.LimitReader(rd, maxConfigSize+1))
 	if err != nil {
 		return nil, fmt.Errorf("pcloud read CONFIG: %w", err)
+	}
+	if len(data) > maxConfigSize {
+		return nil, fmt.Errorf("pcloud CONFIG exceeds %d bytes", maxConfigSize)
 	}
 	return data, nil
 }
@@ -183,8 +125,7 @@ func (c *Connector) List(ctx context.Context, res storage.StorageResource) ([]ob
 		return nil, err
 	}
 
-	dirPath := c.storePath(prefix)
-	meta, err := c.client.ListFolder(ctx, dirPath, bucketed)
+	meta, err := c.client.ListFolder(ctx, c.storePath(prefix), bucketed)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			return []objects.MAC{}, nil
@@ -192,36 +133,34 @@ func (c *Connector) List(ctx context.Context, res storage.StorageResource) ([]ob
 		return nil, err
 	}
 
-	var macs []objects.MAC
-	if bucketed {
-		for _, sub := range meta.Contents {
-			if !sub.IsFolder {
-				continue
-			}
-			for _, item := range sub.Contents {
-				if item.IsFolder {
-					continue
-				}
-				if m, ok := parseMAC(item.Name); ok {
-					macs = append(macs, m)
-				}
-			}
-		}
-	} else {
-		for _, item := range meta.Contents {
+	macs := []objects.MAC{}
+	collect := func(items []Metadata) {
+		for _, item := range items {
 			if item.IsFolder {
 				continue
 			}
+			// Skip anything that is not a MAC (partial uploads, stray files).
 			if m, ok := parseMAC(item.Name); ok {
 				macs = append(macs, m)
 			}
 		}
 	}
-
+	if bucketed {
+		for _, sub := range meta.Contents {
+			if sub.IsFolder {
+				collect(sub.Contents)
+			}
+		}
+	} else {
+		collect(meta.Contents)
+	}
 	return macs, nil
 }
 
 func parseMAC(name string) (objects.MAC, bool) {
+	if len(name) != 64 {
+		return objects.MAC{}, false
+	}
 	raw, err := hex.DecodeString(name)
 	if err != nil || len(raw) != 32 {
 		return objects.MAC{}, false
@@ -231,6 +170,9 @@ func parseMAC(name string) (objects.MAC, bool) {
 	return m, true
 }
 
+// Put stores an object. Objects are bounded by the repository packfile size,
+// so they are held in memory to allow verified, retried uploads. Nothing is
+// ever written to the local disk.
 func (c *Connector) Put(ctx context.Context, res storage.StorageResource, mac objects.MAC, rd io.Reader) (int64, error) {
 	objPath, err := c.objectPath(res, mac)
 	if err != nil {
@@ -242,16 +184,10 @@ func (c *Connector) Put(ctx context.Context, res storage.StorageResource, mac ob
 		return -1, err
 	}
 
-	n, err := c.client.UploadFile(ctx, objPath, bytes.NewReader(data))
-	if err != nil {
+	if _, err := c.client.UploadBytes(ctx, objPath, data, UploadOptions{}); err != nil {
 		return 0, err
 	}
-
-	if cachePath, ok := c.localCachePath(res, mac); ok {
-		writeCacheFileAtomic(cachePath, data)
-	}
-
-	return n, nil
+	return int64(len(data)), nil
 }
 
 func (c *Connector) Get(ctx context.Context, res storage.StorageResource, mac objects.MAC, rg *storage.Range) (io.ReadCloser, error) {
@@ -260,60 +196,49 @@ func (c *Connector) Get(ctx context.Context, res storage.StorageResource, mac ob
 		return nil, err
 	}
 
-	if cachePath, ok := c.localCachePath(res, mac); ok {
-		if rd, err := openCachedFileRange(cachePath, rg); err == nil {
-			return rd, nil
+	notFound := func(err error) error {
+		if errors.Is(err, fs.ErrNotExist) && res == storage.StorageResourcePackfile {
+			return repository.ErrPackfileNotFound
 		}
-
-		// Download immutable packfile/state once and cache on disk so all subsequent
-		// B-tree range reads (e.g. during `plakar ui` or `plakar ls`) are instantaneous.
-		_, err, _ := c.sf.Do(cachePath, func() (any, error) {
-			if _, statErr := os.Stat(cachePath); statErr == nil {
-				return nil, nil
-			}
-			remoteRd, dlErr := c.client.OpenFile(ctx, objPath, nil)
-			if dlErr != nil {
-				return nil, dlErr
-			}
-			defer remoteRd.Close()
-			data, readErr := io.ReadAll(remoteRd)
-			if readErr != nil {
-				return nil, readErr
-			}
-			writeCacheFileAtomic(cachePath, data)
-			return nil, nil
-		})
-		if err != nil {
-			if errors.Is(err, fs.ErrNotExist) && res == storage.StorageResourcePackfile {
-				return nil, repository.ErrPackfileNotFound
-			}
-			return nil, err
-		}
-
-		if rd, err := openCachedFileRange(cachePath, rg); err == nil {
-			return rd, nil
-		}
+		return err
 	}
 
-	rd, err := c.client.OpenFile(ctx, objPath, rg)
-	if err != nil {
-		if errors.Is(err, fs.ErrNotExist) && res == storage.StorageResourcePackfile {
-			return nil, repository.ErrPackfileNotFound
+	if rg == nil {
+		rd, err := c.client.OpenFile(ctx, objPath, 0, -1)
+		if err != nil {
+			return nil, notFound(err)
 		}
-		return nil, err
+		return rd, nil
+	}
+	if rg.Length == 0 {
+		return io.NopCloser(bytes.NewReader(nil)), nil
+	}
+
+	offset, length := int64(rg.Offset), int64(rg.Length)
+	if c.cache != nil && isCacheable(res) && length <= maxCachedRead {
+		data, err := c.cache.readRange(ctx, objPath, offset, length, func(ctx context.Context, off, n int64) ([]byte, error) {
+			return readAllFrom(c.client.OpenFile(ctx, objPath, off, n))
+		})
+		if err != nil {
+			return nil, notFound(err)
+		}
+		return io.NopCloser(bytes.NewReader(data)), nil
+	}
+
+	rd, err := c.client.OpenFile(ctx, objPath, offset, length)
+	if err != nil {
+		return nil, notFound(err)
 	}
 	return rd, nil
 }
 
 func (c *Connector) Delete(ctx context.Context, res storage.StorageResource, mac objects.MAC) error {
-	if cachePath, ok := c.localCachePath(res, mac); ok {
-		_ = os.Remove(cachePath)
-	}
-
 	objPath, err := c.objectPath(res, mac)
 	if err != nil {
 		return err
 	}
+	c.cache.evictObject(objPath)
+
 	err = c.client.DeleteFile(ctx, objPath)
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil

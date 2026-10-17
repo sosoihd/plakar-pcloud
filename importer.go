@@ -31,48 +31,43 @@ func (c *Connector) Import(ctx context.Context, records chan<- *connectors.Recor
 
 	rootMeta, err := c.client.ListFolder(ctx, c.rootDir, true)
 	if err != nil {
-		// Check if rootDir points to a single file rather than a folder.
+		// rootDir may point to a single file rather than a folder.
 		st, statErr := c.client.Stat(ctx, c.rootDir)
-		if statErr != nil || st == nil {
+		if statErr != nil || st == nil || st.IsFolder {
 			return err
 		}
-		if !st.IsFolder {
-			c.emitMetadata(ctx, c.rootDir, *st, records)
-			return nil
-		}
-		return err
+		c.emit(ctx, c.rootDir, *st, records)
+		return ctx.Err()
 	}
 
 	c.walkTree(ctx, c.rootDir, *rootMeta, records)
 	return ctx.Err()
 }
 
-func (c *Connector) walkTree(ctx context.Context, currentPath string, meta Metadata, records chan<- *connectors.Record) {
-	if ctx.Err() != nil {
-		return
-	}
-
+func (c *Connector) walkTree(ctx context.Context, currentPath string, meta Metadata, records chan<- *connectors.Record) bool {
 	currentPath = cleanRemotePath(currentPath)
 	if currentPath != "/" && c.excludes != nil && c.excludes.IsExcluded(currentPath, meta.IsFolder) {
-		return
+		return true
 	}
 
-	c.emitMetadata(ctx, currentPath, meta, records)
-
+	if !c.emit(ctx, currentPath, meta, records) {
+		return false
+	}
 	if !meta.IsFolder {
-		return
+		return true
 	}
 
 	for _, child := range meta.Contents {
-		if ctx.Err() != nil {
-			return
+		if !c.walkTree(ctx, path.Join(currentPath, child.Name), child, records) {
+			return false
 		}
-		childPath := path.Join(currentPath, child.Name)
-		c.walkTree(ctx, childPath, child, records)
 	}
+	return true
 }
 
-func (c *Connector) emitMetadata(ctx context.Context, entryPath string, meta Metadata, records chan<- *connectors.Record) {
+// emit sends one record, giving up when ctx is cancelled so that Import never
+// blocks on a consumer that has stopped reading.
+func (c *Connector) emit(ctx context.Context, entryPath string, meta Metadata, records chan<- *connectors.Record) bool {
 	name := meta.Name
 	if entryPath == "/" || name == "" {
 		name = path.Base(entryPath)
@@ -88,15 +83,26 @@ func (c *Connector) emitMetadata(ctx context.Context, entryPath string, meta Met
 		Lsize:    meta.Size,
 		Lmode:    mode,
 		LmodTime: meta.ModTime(),
+		Lnlink:   1,
 	}
-
 	if meta.IsFolder {
-		records <- connectors.NewRecord(entryPath, "", fi, nil, nil)
-		return
+		fi.Lsize = 0
 	}
 
-	filePath := entryPath
-	records <- connectors.NewRecord(filePath, "", fi, nil, func() (io.ReadCloser, error) {
-		return c.client.OpenFile(ctx, filePath, nil)
-	})
+	var rec *connectors.Record
+	if meta.IsFolder {
+		rec = connectors.NewRecord(entryPath, "", fi, nil, nil)
+	} else {
+		filePath := entryPath
+		rec = connectors.NewRecord(filePath, "", fi, nil, func() (io.ReadCloser, error) {
+			return c.client.OpenFile(ctx, filePath, 0, -1)
+		})
+	}
+
+	select {
+	case records <- rec:
+		return true
+	case <-ctx.Done():
+		return false
+	}
 }

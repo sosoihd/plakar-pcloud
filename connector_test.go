@@ -1,420 +1,109 @@
+/*
+ * Copyright (c) 2026 sosoihd
+ *
+ * Permission to use, copy, modify, and distribute this software for any
+ * purpose with or without fee is hereby granted, provided that the above
+ * copyright notice and this permission notice appear in all copies.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+ * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+ * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+ * ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+ * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+ * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+ * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+ */
+
 package pcloud
 
 import (
-	"bytes"
-	"crypto/sha1"
-	"encoding/hex"
-	"encoding/json"
-	"errors"
-	"io"
-	"io/fs"
-	"net/http"
-	"net/http/httptest"
-	"net/url"
-	"os"
-	"path"
-	"path/filepath"
-	"runtime"
-	"sort"
-	"strconv"
 	"strings"
-	"sync"
 	"testing"
-	"time"
 
 	"github.com/PlakarKorp/kloset/connectors"
+	"github.com/PlakarKorp/kloset/connectors/exporter"
+	"github.com/PlakarKorp/kloset/connectors/importer"
 	"github.com/PlakarKorp/kloset/connectors/storage"
 	"github.com/PlakarKorp/kloset/location"
-	"github.com/PlakarKorp/kloset/objects"
-	"github.com/PlakarKorp/kloset/repository"
 )
 
-type fakeEntry struct {
-	isFolder bool
-	data     []byte
-	modTime  time.Time
-}
+// Compile-time interface checks.
+var (
+	_ importer.Importer = (*Connector)(nil)
+	_ exporter.Exporter = (*Connector)(nil)
+	_ storage.Store     = (*Connector)(nil)
+)
 
-type fakePCloudServer struct {
-	mu      sync.Mutex
-	entries map[string]*fakeEntry
-	token   string
-	user    string
-	pass    string
-	digest  string
-}
-
-func newFakePCloudServer() *fakePCloudServer {
-	s := &fakePCloudServer{
-		entries: make(map[string]*fakeEntry),
-		token:   "test-access-token",
-		user:    "alice@example.com",
-		pass:    "secret123",
-		digest:  "random-digest-value",
-	}
-	s.entries["/"] = &fakeEntry{isFolder: true, modTime: time.Now()}
-	return s
-}
-
-func (s *fakePCloudServer) seedFolder(remotePath string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	remotePath = cleanRemotePath(remotePath)
-	parts := strings.Split(strings.TrimPrefix(remotePath, "/"), "/")
-	cur := ""
-	for _, part := range parts {
-		if part == "" {
-			continue
+func TestConfigParsing(t *testing.T) {
+	tok := map[string]string{"access_token": "tok"}
+	with := func(kv ...string) map[string]string {
+		m := map[string]string{}
+		for k, v := range tok {
+			m[k] = v
 		}
-		cur = cur + "/" + part
-		if _, ok := s.entries[cur]; !ok {
-			s.entries[cur] = &fakeEntry{isFolder: true, modTime: time.Now()}
+		for i := 0; i+1 < len(kv); i += 2 {
+			m[kv[i]] = kv[i+1]
 		}
-	}
-}
-
-func (s *fakePCloudServer) seedFile(remotePath string, content []byte) {
-	remotePath = cleanRemotePath(remotePath)
-	s.seedFolder(path.Dir(remotePath))
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.entries[remotePath] = &fakeEntry{
-		isFolder: false,
-		data:     append([]byte(nil), content...),
-		modTime:  time.Now(),
-	}
-}
-
-func (s *fakePCloudServer) checkAuth(r *http.Request) bool {
-	if authHeader := r.Header.Get("Authorization"); authHeader == "Bearer "+s.token {
-		return true
-	}
-	q := r.URL.Query()
-	if q.Get("access_token") == s.token || q.Get("auth") == "session-token-ok" {
-		return true
-	}
-	return false
-}
-
-func (s *fakePCloudServer) buildMetadataLocked(p string, recursive bool) (*Metadata, bool) {
-	p = cleanRemotePath(p)
-	e, ok := s.entries[p]
-	if !ok {
-		return nil, false
-	}
-	name := path.Base(p)
-	if p == "/" {
-		name = "/"
-	}
-	meta := &Metadata{
-		Name:     name,
-		Path:     p,
-		IsFolder: e.isFolder,
-		Size:     int64(len(e.data)),
-		Modified: e.modTime.UTC().Format(time.RFC1123Z),
-	}
-	if !e.isFolder {
-		return meta, true
+		return m
 	}
 
-	var childPaths []string
-	prefix := p
-	if prefix != "/" {
-		prefix += "/"
-	}
-	for k := range s.entries {
-		if k == p || !strings.HasPrefix(k, prefix) {
-			continue
-		}
-		rest := strings.TrimPrefix(k, prefix)
-		if !strings.Contains(rest, "/") {
-			childPaths = append(childPaths, k)
-		}
-	}
-	sort.Strings(childPaths)
-
-	for _, cp := range childPaths {
-		ce := s.entries[cp]
-		if ce.isFolder && recursive {
-			if cm, ok := s.buildMetadataLocked(cp, true); ok {
-				meta.Contents = append(meta.Contents, *cm)
-			}
-		} else {
-			meta.Contents = append(meta.Contents, Metadata{
-				Name:     path.Base(cp),
-				Path:     cp,
-				IsFolder: ce.isFolder,
-				Size:     int64(len(ce.data)),
-				Modified: ce.modTime.UTC().Format(time.RFC1123Z),
-			})
-		}
-	}
-	return meta, true
-}
-
-func (s *fakePCloudServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	q := r.URL.Query()
-
-	writeJSON := func(v any) {
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(v)
-	}
-	rawMeta := func(v any) json.RawMessage {
-		b, _ := json.Marshal(v)
-		return b
-	}
-
-	switch r.URL.Path {
-	case "/getdigest":
-		writeJSON(baseResponse{Result: 0, Digest: s.digest})
-		return
-
-	case "/userinfo":
-		if q.Get("getauth") == "1" {
-			userHash := sha1.Sum([]byte(strings.ToLower(s.user)))
-			expectedHash := sha1.Sum([]byte(s.pass + hex.EncodeToString(userHash[:]) + s.digest))
-			expectedDigest := hex.EncodeToString(expectedHash[:])
-			if q.Get("username") == s.user && q.Get("passworddigest") == expectedDigest {
-				writeJSON(baseResponse{Result: 0, Auth: "session-token-ok"})
-				return
-			}
-			writeJSON(baseResponse{Result: 2000, Error: "Log in failed."})
-			return
-		}
-		if !s.checkAuth(r) {
-			writeJSON(baseResponse{Result: 2000, Error: "Log in required."})
-			return
-		}
-		writeJSON(baseResponse{Result: 0})
-		return
-	}
-
-	if strings.HasPrefix(r.URL.Path, "/dl/") {
-		p := cleanRemotePath(strings.TrimPrefix(r.URL.Path, "/dl"))
-		s.mu.Lock()
-		e, ok := s.entries[p]
-		s.mu.Unlock()
-		if !ok || e.isFolder {
-			http.NotFound(w, r)
-			return
-		}
-		data := e.data
-		if rg := r.Header.Get("Range"); strings.HasPrefix(rg, "bytes=") {
-			spec := strings.TrimPrefix(rg, "bytes=")
-			parts := strings.SplitN(spec, "-", 2)
-			if len(parts) == 2 {
-				start, _ := strconv.Atoi(parts[0])
-				end, _ := strconv.Atoi(parts[1])
-				if start < len(data) {
-					if end >= len(data) {
-						end = len(data) - 1
-					}
-					w.WriteHeader(http.StatusPartialContent)
-					_, _ = w.Write(data[start : end+1])
-					return
-				}
-			}
-		}
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write(data)
-		return
-	}
-
-	if !s.checkAuth(r) {
-		writeJSON(baseResponse{Result: 2000, Error: "Log in required."})
-		return
-	}
-
-	switch r.URL.Path {
-	case "/stat":
-		p := cleanRemotePath(q.Get("path"))
-		s.mu.Lock()
-		meta, ok := s.buildMetadataLocked(p, false)
-		s.mu.Unlock()
-		if !ok {
-			writeJSON(baseResponse{Result: 2009, Error: "File not found."})
-			return
-		}
-		writeJSON(baseResponse{Result: 0, Metadata: rawMeta(meta)})
-
-	case "/listfolder":
-		p := cleanRemotePath(q.Get("path"))
-		rec := q.Get("recursive") == "1"
-		s.mu.Lock()
-		meta, ok := s.buildMetadataLocked(p, rec)
-		s.mu.Unlock()
-		if !ok || !meta.IsFolder {
-			writeJSON(baseResponse{Result: 2005, Error: "Directory does not exist."})
-			return
-		}
-		writeJSON(baseResponse{Result: 0, Metadata: rawMeta(meta)})
-
-	case "/createfolderifnotexists", "/createfolder":
-		p := cleanRemotePath(q.Get("path"))
-		s.mu.Lock()
-		parent := path.Dir(p)
-		if _, ok := s.entries[parent]; !ok {
-			s.mu.Unlock()
-			writeJSON(baseResponse{Result: 2002, Error: "A component of parent directory does not exist."})
-			return
-		}
-		if _, exists := s.entries[p]; !exists {
-			s.entries[p] = &fakeEntry{isFolder: true, modTime: time.Now()}
-		}
-		meta, _ := s.buildMetadataLocked(p, false)
-		s.mu.Unlock()
-		writeJSON(baseResponse{Result: 0, Metadata: rawMeta(meta)})
-
-	case "/uploadfile":
-		dir := cleanRemotePath(q.Get("path"))
-		filename := q.Get("filename")
-		if err := r.ParseMultipartForm(16 << 20); err != nil {
-			writeJSON(baseResponse{Result: 4000, Error: err.Error()})
-			return
-		}
-		f, hdr, err := r.FormFile("file")
-		if err != nil {
-			writeJSON(baseResponse{Result: 4000, Error: err.Error()})
-			return
-		}
-		defer f.Close()
-		if filename == "" {
-			filename = hdr.Filename
-		}
-		content, err := io.ReadAll(f)
-		if err != nil {
-			writeJSON(baseResponse{Result: 4000, Error: err.Error()})
-			return
-		}
-		fullPath := cleanRemotePath(path.Join(dir, filename))
-		s.mu.Lock()
-		if _, ok := s.entries[dir]; !ok {
-			s.mu.Unlock()
-			writeJSON(baseResponse{Result: 2002, Error: "Parent directory does not exist."})
-			return
-		}
-		s.entries[fullPath] = &fakeEntry{
-			isFolder: false,
-			data:     content,
-			modTime:  time.Now(),
-		}
-		meta, _ := s.buildMetadataLocked(fullPath, false)
-		s.mu.Unlock()
-		writeJSON(baseResponse{Result: 0, Metadata: rawMeta([]*Metadata{meta})})
-
-	case "/getfilelink":
-		p := cleanRemotePath(q.Get("path"))
-		s.mu.Lock()
-		e, ok := s.entries[p]
-		s.mu.Unlock()
-		if !ok || e.isFolder {
-			writeJSON(baseResponse{Result: 2009, Error: "File not found."})
-			return
-		}
-		writeJSON(baseResponse{
-			Result: 0,
-			Hosts:  []string{r.Host},
-			Path:   "/dl" + p,
-		})
-
-	case "/deletefile":
-		p := cleanRemotePath(q.Get("path"))
-		s.mu.Lock()
-		e, ok := s.entries[p]
-		if !ok || e.isFolder {
-			s.mu.Unlock()
-			writeJSON(baseResponse{Result: 2009, Error: "File not found."})
-			return
-		}
-		delete(s.entries, p)
-		s.mu.Unlock()
-		writeJSON(baseResponse{Result: 0})
-
-	default:
-		http.NotFound(w, r)
-	}
-}
-
-func newTestConnector(t *testing.T, srv *httptest.Server, extra map[string]string) *Connector {
-	t.Helper()
-	u, err := url.Parse(srv.URL)
-	if err != nil {
-		t.Fatalf("parse server url: %v", err)
-	}
-	cfg := map[string]string{
-		"location":     "pcloud://" + u.Host + "/backups",
-		"access_token": "test-access-token",
-		"insecure":     "true",
-	}
-	for k, v := range extra {
-		cfg[k] = v
-	}
-	opts := &connectors.Options{
-		Hostname:        "localhost",
-		OperatingSystem: runtime.GOOS,
-		Architecture:    runtime.GOARCH,
-		CWD:             "/",
-		MaxConcurrency:  2,
-	}
-	conn, err := New(t.Context(), opts, "pcloud", cfg, srv.Client())
-	if err != nil {
-		t.Fatalf("New connector failed: %v", err)
-	}
-	return conn
-}
-
-func TestMetadataAndRegions(t *testing.T) {
 	tests := []struct {
 		name       string
 		config     map[string]string
 		wantOrigin string
 		wantRoot   string
-		wantErr    bool
+		wantErr    string
 	}{
-		{
-			name: "default US region with folder path",
-			config: map[string]string{
-				"location":     "pcloud:///Documents/Notes",
-				"access_token": "tok",
-			},
-			wantOrigin: DefaultHostUS,
-			wantRoot:   "/Documents/Notes",
-		},
-		{
-			name: "EU region via host shorthand",
-			config: map[string]string{
-				"location":     "pcloud://eu/MyBackups",
-				"access_token": "tok",
-			},
-			wantOrigin: DefaultHostEU,
-			wantRoot:   "/MyBackups",
-		},
-		{
-			name: "EU region via parameter",
-			config: map[string]string{
-				"location":     "pcloud:///Photos",
-				"region":       "eu",
-				"access_token": "tok",
-			},
-			wantOrigin: DefaultHostEU,
-			wantRoot:   "/Photos",
-		},
-		{
-			name: "missing credentials fails",
-			config: map[string]string{
-				"location": "pcloud:///Photos",
-			},
-			wantErr: true,
-		},
+		{name: "default US with path", config: with("location", "pcloud:///Documents/Notes"), wantOrigin: DefaultHostUS, wantRoot: "/Documents/Notes"},
+		{name: "empty path is root", config: with("location", "pcloud://"), wantOrigin: DefaultHostUS, wantRoot: "/"},
+		{name: "eu shorthand", config: with("location", "pcloud://eu/MyBackups"), wantOrigin: DefaultHostEU, wantRoot: "/MyBackups"},
+		{name: "us shorthand", config: with("location", "pcloud://us/x"), wantOrigin: DefaultHostUS, wantRoot: "/x"},
+		{name: "EU uppercase", config: with("location", "pcloud://EU/x"), wantOrigin: DefaultHostEU, wantRoot: "/x"},
+		{name: "official EU host", config: with("location", "pcloud://eapi.pcloud.com/Photos"), wantOrigin: DefaultHostEU, wantRoot: "/Photos"},
+		{name: "official US host", config: with("location", "pcloud://api.pcloud.com/Photos"), wantOrigin: DefaultHostUS, wantRoot: "/Photos"},
+		{name: "region parameter", config: with("location", "pcloud:///Photos", "region", "eu"), wantOrigin: DefaultHostEU, wantRoot: "/Photos"},
+		{name: "region parameter is case-insensitive", config: with("location", "pcloud:///P", "region", " EU "), wantOrigin: DefaultHostEU, wantRoot: "/P"},
+		{name: "first segment as folder", config: with("location", "pcloud://Documents/Sub"), wantOrigin: DefaultHostUS, wantRoot: "/Documents/Sub"},
+		{name: "dotted folder is not a host", config: with("location", "pcloud://my.photos/2024"), wantOrigin: DefaultHostUS, wantRoot: "/my.photos/2024"},
+		{name: "host:port is not a host", config: with("location", "pcloud://evil.example.com:443/x"), wantOrigin: DefaultHostUS, wantRoot: "/evil.example.com:443/x"},
+		{name: "localhost is a folder", config: with("location", "pcloud://localhost/x"), wantOrigin: DefaultHostUS, wantRoot: "/localhost/x"},
+		{name: "explicit root overrides path", config: with("location", "pcloud:///ignored", "root", "/Real"), wantOrigin: DefaultHostUS, wantRoot: "/Real"},
+		{name: "relative root is cleaned", config: with("location", "pcloud://", "root", "a/../b"), wantOrigin: DefaultHostUS, wantRoot: "/b"},
+		{name: "traversal in path is cleaned", config: with("location", "pcloud:///a/../../etc"), wantOrigin: DefaultHostUS, wantRoot: "/etc"},
+		{name: "custom endpoint", config: with("location", "pcloud:///x", "endpoint", "127.0.0.1:8080"), wantOrigin: "127.0.0.1:8080", wantRoot: "/x"},
+		{name: "custom endpoint with scheme", config: with("location", "pcloud:///x", "endpoint", "https://mock.example/"), wantOrigin: "mock.example", wantRoot: "/x"},
+		{name: "custom endpoint localhost:port", config: with("location", "pcloud:///x", "endpoint", "localhost:9000"), wantOrigin: "localhost:9000", wantRoot: "/x"},
+		{name: "insecure with endpoint", config: with("location", "pcloud:///x", "endpoint", "127.0.0.1:1", "insecure", "true"), wantOrigin: "127.0.0.1:1", wantRoot: "/x"},
+		{name: "session token", config: map[string]string{"location": "pcloud:///", "auth": "sess"}, wantOrigin: DefaultHostUS, wantRoot: "/"},
+		{name: "username and password", config: map[string]string{"location": "pcloud:///", "username": "u", "password": "p"}, wantOrigin: DefaultHostUS, wantRoot: "/"},
+		{name: "cache size", config: with("location", "pcloud:///", "cache_size", "64MiB"), wantOrigin: DefaultHostUS, wantRoot: "/"},
+		{name: "cache disabled", config: with("location", "pcloud:///", "cache_size", "0"), wantOrigin: DefaultHostUS, wantRoot: "/"},
+
+		{name: "missing location", config: tok, wantErr: "missing location"},
+		{name: "blank location", config: with("location", "  "), wantErr: "missing location"},
+		{name: "wrong scheme", config: with("location", "s3://bucket/x"), wantErr: "scheme"},
+		{name: "missing credentials", config: map[string]string{"location": "pcloud:///"}, wantErr: "missing credentials"},
+		{name: "username without password", config: map[string]string{"location": "pcloud:///", "username": "u"}, wantErr: "missing credentials"},
+		{name: "credentials in location", config: with("location", "pcloud://user:pass@eu/x"), wantErr: "must not be embedded"},
+		{name: "username in location", config: with("location", "pcloud://user@eu/x"), wantErr: "must not be embedded"},
+		{name: "invalid region", config: with("location", "pcloud:///", "region", "asia"), wantErr: "invalid region"},
+		{name: "invalid insecure", config: with("location", "pcloud:///", "insecure", "maybe"), wantErr: "invalid insecure"},
+		{name: "invalid debug", config: with("location", "pcloud:///", "debug", "maybe"), wantErr: "invalid debug"},
+		{name: "insecure without endpoint", config: with("location", "pcloud:///", "insecure", "true"), wantErr: "only allowed together with a custom endpoint"},
+		{name: "endpoint with path", config: with("location", "pcloud:///", "endpoint", "https://h.example/api"), wantErr: "invalid endpoint"},
+		{name: "endpoint with userinfo", config: with("location", "pcloud:///", "endpoint", "https://u:p@h.example"), wantErr: "invalid endpoint"},
+		{name: "invalid cache size", config: with("location", "pcloud:///", "cache_size", "lots"), wantErr: "invalid cache_size"},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			conn, err := New(t.Context(), nil, "pcloud", tc.config, nil)
-			if tc.wantErr {
+			if tc.wantErr != "" {
 				if err == nil {
-					t.Fatalf("expected error, got nil")
+					t.Fatalf("expected error containing %q, got nil (origin=%s root=%s)", tc.wantErr, conn.Origin(), conn.Root())
+				}
+				if !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("error %q does not contain %q", err, tc.wantErr)
 				}
 				return
 			}
@@ -422,7 +111,7 @@ func TestMetadataAndRegions(t *testing.T) {
 				t.Fatalf("unexpected error: %v", err)
 			}
 			if conn.Type() != "pcloud" {
-				t.Errorf("Type() = %q, want pcloud", conn.Type())
+				t.Errorf("Type() = %q", conn.Type())
 			}
 			if conn.Origin() != tc.wantOrigin {
 				t.Errorf("Origin() = %q, want %q", conn.Origin(), tc.wantOrigin)
@@ -437,301 +126,109 @@ func TestMetadataAndRegions(t *testing.T) {
 	}
 }
 
-func TestDigestAuthAndPing(t *testing.T) {
-	fake := newFakePCloudServer()
-	srv := httptest.NewServer(fake)
-	defer srv.Close()
-
-	u, _ := url.Parse(srv.URL)
-	conn, err := New(t.Context(), nil, "pcloud", map[string]string{
-		"location": "pcloud://" + u.Host + "/",
-		"username": fake.user,
-		"password": fake.pass,
-		"insecure": "true",
-	}, srv.Client())
+func TestSchemeFollowsInsecureFlag(t *testing.T) {
+	conn, err := New(t.Context(), nil, "pcloud", map[string]string{"location": "pcloud://eu/", "access_token": "t"}, nil)
 	if err != nil {
-		t.Fatalf("New failed: %v", err)
+		t.Fatal(err)
 	}
+	if conn.client.scheme != "https" {
+		t.Errorf("official hosts must use https, got %s", conn.client.scheme)
+	}
+	conn, err = New(t.Context(), nil, "pcloud", map[string]string{"location": "pcloud:///", "access_token": "t", "endpoint": "127.0.0.1:1", "insecure": "1"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if conn.client.scheme != "http" {
+		t.Errorf("insecure endpoint should use http, got %s", conn.client.scheme)
+	}
+}
+
+func TestCacheSizeConfiguration(t *testing.T) {
+	cfg := func(size string) map[string]string {
+		m := map[string]string{"location": "pcloud:///", "access_token": "t"}
+		if size != "" {
+			m["cache_size"] = size
+		}
+		return m
+	}
+	conn, _ := New(t.Context(), nil, "pcloud", cfg(""), nil)
+	if conn.cache == nil || conn.cache.budget != defaultCacheSize {
+		t.Errorf("default cache budget not applied")
+	}
+	conn, _ = New(t.Context(), nil, "pcloud", cfg("0"), nil)
+	if conn.cache != nil {
+		t.Errorf("cache_size=0 must disable the cache")
+	}
+	conn, _ = New(t.Context(), nil, "pcloud", cfg("16MB"), nil)
+	if conn.cache == nil || conn.cache.budget != 16_000_000 {
+		t.Errorf("cache_size=16MB not honoured")
+	}
+}
+
+func TestOptionsAreApplied(t *testing.T) {
+	opts := &connectors.Options{MaxConcurrency: 9, Excludes: []string{"*.tmp"}}
+	conn, err := New(t.Context(), opts, "pcloud", map[string]string{"location": "pcloud:///", "access_token": "t"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if conn.maxConcurrency != 9 {
+		t.Errorf("maxConcurrency = %d", conn.maxConcurrency)
+	}
+	if !conn.excludes.IsExcluded("/a/b.tmp", false) {
+		t.Errorf("exclude rules not applied")
+	}
+}
+
+func TestUnsupportedProtocol(t *testing.T) {
+	if _, err := New(t.Context(), nil, "s3", map[string]string{"location": "pcloud:///", "access_token": "t"}, nil); err == nil {
+		t.Fatal("expected unsupported protocol error")
+	}
+}
+
+func TestPublicConstructors(t *testing.T) {
+	cfg := map[string]string{"location": "pcloud://eu/x", "access_token": "t"}
+	if imp, err := NewImporter(t.Context(), &connectors.Options{}, "pcloud", cfg); err != nil || imp.Root() != "/x" {
+		t.Errorf("NewImporter: %v", err)
+	}
+	if exp, err := NewExporter(t.Context(), &connectors.Options{}, "pcloud", cfg); err != nil || exp.Origin() != DefaultHostEU {
+		t.Errorf("NewExporter: %v", err)
+	}
+	if st, err := NewStore(t.Context(), "pcloud", cfg); err != nil || st.Type() != "pcloud" {
+		t.Errorf("NewStore: %v", err)
+	}
+}
+
+func TestIsContained(t *testing.T) {
+	tests := []struct {
+		root, joined string
+		want         bool
+	}{
+		{"/r", "/r", true},
+		{"/r", "/r/a", true},
+		{"/r", "/r/../etc", false},
+		{"/r", "/rx", false},
+		{"/", "/anything", true},
+		{"/r/", "/r/a", true},
+	}
+	for _, tc := range tests {
+		if got := isContained(tc.root, tc.joined); got != tc.want {
+			t.Errorf("isContained(%q, %q) = %v, want %v", tc.root, tc.joined, got, tc.want)
+		}
+	}
+}
+
+func TestPingAndClose(t *testing.T) {
+	s := newFakePCloud(t)
+	conn := newTestConnector(t, s, nil)
 	if err := conn.Ping(t.Context()); err != nil {
-		t.Fatalf("Ping with digest auth failed: %v", err)
+		t.Fatal(err)
 	}
-}
-
-// Test1_BackupFileFromPCloudToLocalMac teste la sauvegarde d'un fichier (et d'une arborescence)
-// présent sur pCloud vers un dossier local sur le Mac via le connecteur Importer.
-func Test1_BackupFileFromPCloudToLocalMac(t *testing.T) {
-	fake := newFakePCloudServer()
-	srv := httptest.NewServer(fake)
-	defer srv.Close()
-
-	// 1. On place des fichiers sur le serveur pCloud distant
-	pcloudFiles := map[string]string{
-		"/Documents/notes.md":            "# Mes notes sur pCloud\nSauvegardées sur mon Mac via Plakar.\n",
-		"/Documents/projets/readme.txt":  "Contenu du fichier readme depuis pCloud\n",
-		"/Documents/projets/config.json": `{"env":"prod","region":"eu"}`,
-	}
-	for remotePath, content := range pcloudFiles {
-		fake.seedFile(remotePath, []byte(content))
+	if err := conn.Close(t.Context()); err != nil {
+		t.Fatal(err)
 	}
 
-	// 2. Dossier local sur le Mac qui recevra la sauvegarde issue de pCloud
-	macBackupDir := t.TempDir()
-
-	// 3. On initialise l'Importer pCloud pointant sur /Documents
-	conn := newTestConnector(t, srv, map[string]string{
-		"root": "/Documents",
-	})
-
-	records := make(chan *connectors.Record)
-	done := make(chan struct{})
-
-	go func() {
-		defer close(done)
-		for rec := range records {
-			if rec.Err != nil {
-				t.Errorf("erreur d'import sur %s: %v", rec.Pathname, rec.Err)
-				continue
-			}
-
-			localTarget := filepath.Join(macBackupDir, filepath.FromSlash(rec.Pathname))
-			if rec.FileInfo.IsDir() {
-				if err := os.MkdirAll(localTarget, 0755); err != nil {
-					t.Errorf("mkdir local %s: %v", localTarget, err)
-				}
-				_ = rec.Close()
-				continue
-			}
-
-			if err := os.MkdirAll(filepath.Dir(localTarget), 0755); err != nil {
-				t.Errorf("mkdir parent local %s: %v", localTarget, err)
-				_ = rec.Close()
-				continue
-			}
-
-			data, err := io.ReadAll(rec.Reader)
-			_ = rec.Close()
-			if err != nil {
-				t.Errorf("lecture depuis pCloud %s: %v", rec.Pathname, err)
-				continue
-			}
-
-			if err := os.WriteFile(localTarget, data, 0644); err != nil {
-				t.Errorf("écriture sur le Mac %s: %v", localTarget, err)
-			}
-		}
-	}()
-
-	if err := conn.Import(t.Context(), records, nil); err != nil {
-		t.Fatalf("Import depuis pCloud échoué: %v", err)
-	}
-	<-done
-
-	// 4. On vérifie que chaque fichier de pCloud est bien présent sur le disque du Mac
-	for remotePath, wantContent := range pcloudFiles {
-		localPath := filepath.Join(macBackupDir, filepath.FromSlash(remotePath))
-		gotBytes, err := os.ReadFile(localPath)
-		if err != nil {
-			t.Fatalf("fichier %s non trouvé sur le Mac (%s): %v", remotePath, localPath, err)
-		}
-		if string(gotBytes) != wantContent {
-			t.Errorf("contenu sur le Mac pour %s = %q, attendu %q", remotePath, string(gotBytes), wantContent)
-		}
-	}
-}
-
-// Test2_BackupLocalMacFolderToPCloud teste la sauvegarde d'un dossier local du Mac
-// vers pCloud (via Exporter et via Storage).
-func Test2_BackupLocalMacFolderToPCloud(t *testing.T) {
-	fake := newFakePCloudServer()
-	srv := httptest.NewServer(fake)
-	defer srv.Close()
-
-	// 1. On crée un vrai dossier sur le Mac avec plusieurs fichiers et sous-dossiers
-	macSourceDir := t.TempDir()
-	localFiles := map[string]string{
-		"rapport.txt":             "Rapport annuel depuis mon Mac\n",
-		"scripts/deploy.sh":       "#!/bin/sh\necho 'Deploying to production'\n",
-		"photos/2026/legende.txt": "Souvenirs de voyage\n",
-	}
-
-	for relPath, content := range localFiles {
-		fullLocalPath := filepath.Join(macSourceDir, filepath.FromSlash(relPath))
-		if err := os.MkdirAll(filepath.Dir(fullLocalPath), 0755); err != nil {
-			t.Fatalf("création dossier local sur le Mac: %v", err)
-		}
-		if err := os.WriteFile(fullLocalPath, []byte(content), 0644); err != nil {
-			t.Fatalf("création fichier local sur le Mac: %v", err)
-		}
-	}
-
-	// 2. On configure le connecteur pCloud cible dans /MacBackup
-	conn := newTestConnector(t, srv, map[string]string{
-		"root": "/MacBackup",
-	})
-
-	exportRecords := make(chan *connectors.Record)
-	exportResults := make(chan *connectors.Result)
-
-	// On parcourt le dossier local du Mac et on envoie chaque entrée vers pCloud
-	go func() {
-		defer close(exportRecords)
-		_ = filepath.WalkDir(macSourceDir, func(currentPath string, d fs.DirEntry, walkErr error) error {
-			if walkErr != nil {
-				return walkErr
-			}
-			info, err := d.Info()
-			if err != nil {
-				return err
-			}
-			rel, err := filepath.Rel(macSourceDir, currentPath)
-			if err != nil {
-				return err
-			}
-			slashRel := "/"
-			if rel != "." {
-				slashRel = "/" + filepath.ToSlash(rel)
-			}
-
-			var rd io.ReadCloser
-			if !d.IsDir() {
-				f, err := os.Open(currentPath)
-				if err != nil {
-					return err
-				}
-				rd = f
-			}
-
-			exportRecords <- &connectors.Record{
-				Reader:   rd,
-				Pathname: slashRel,
-				FileInfo: objects.FileInfo{
-					Lname:    info.Name(),
-					Lsize:    info.Size(),
-					Lmode:    info.Mode(),
-					LmodTime: info.ModTime(),
-				},
-			}
-			return nil
-		})
-	}()
-
-	var exportErrs []error
-	doneResults := make(chan struct{})
-	go func() {
-		defer close(doneResults)
-		for res := range exportResults {
-			if res.Err != nil {
-				exportErrs = append(exportErrs, res.Err)
-			}
-		}
-	}()
-
-	if err := conn.Export(t.Context(), exportRecords, exportResults); err != nil {
-		t.Fatalf("Export du dossier Mac vers pCloud échoué: %v", err)
-	}
-	<-doneResults
-	if len(exportErrs) > 0 {
-		t.Fatalf("erreurs lors de l'envoi vers pCloud: %v", exportErrs)
-	}
-
-	// 3. On vérifie sur le serveur pCloud que tous les fichiers du Mac y sont bien stockés
-	for relPath, wantContent := range localFiles {
-		remotePCloudPath := path.Join("/MacBackup", relPath)
-		rd, err := conn.client.OpenFile(t.Context(), remotePCloudPath, nil)
-		if err != nil {
-			t.Fatalf("fichier %s introuvable sur pCloud après backup: %v", remotePCloudPath, err)
-		}
-		gotBytes, err := io.ReadAll(rd)
-		_ = rd.Close()
-		if err != nil {
-			t.Fatalf("lecture du fichier %s sur pCloud: %v", remotePCloudPath, err)
-		}
-		if string(gotBytes) != wantContent {
-			t.Errorf("contenu sur pCloud pour %s = %q, attendu %q", remotePCloudPath, string(gotBytes), wantContent)
-		}
-	}
-}
-
-func TestStorageLifecycle(t *testing.T) {
-	fake := newFakePCloudServer()
-	srv := httptest.NewServer(fake)
-	defer srv.Close()
-
-	store := newTestConnector(t, srv, map[string]string{
-		"root": "/kloset-repo",
-	})
-
-	ctx := t.Context()
-	cfgBytes := []byte("kloset-repository-config-v1")
-
-	if err := store.Create(ctx, cfgBytes); err != nil {
-		t.Fatalf("Create failed: %v", err)
-	}
-
-	// Second Create must fail because CONFIG already exists
-	if err := store.Create(ctx, cfgBytes); err == nil {
-		t.Fatalf("expected second Create to fail")
-	}
-
-	opened, err := store.Open(ctx)
-	if err != nil {
-		t.Fatalf("Open failed: %v", err)
-	}
-	if !bytes.Equal(opened, cfgBytes) {
-		t.Fatalf("Open returned %q, want %q", string(opened), string(cfgBytes))
-	}
-
-	var mac objects.MAC
-	for i := range mac {
-		mac[i] = byte(i + 1)
-	}
-	payload := []byte("0123456789abcdef-packfile-payload")
-
-	n, err := store.Put(ctx, storage.StorageResourcePackfile, mac, bytes.NewReader(payload))
-	if err != nil {
-		t.Fatalf("Put packfile failed: %v", err)
-	}
-	if n != int64(len(payload)) {
-		t.Fatalf("Put size = %d, want %d", n, len(payload))
-	}
-
-	macs, err := store.List(ctx, storage.StorageResourcePackfile)
-	if err != nil {
-		t.Fatalf("List packfiles failed: %v", err)
-	}
-	if len(macs) != 1 || macs[0] != mac {
-		t.Fatalf("List packfiles = %v, want [%x]", macs, mac)
-	}
-
-	// Full Get
-	rd, err := store.Get(ctx, storage.StorageResourcePackfile, mac, nil)
-	if err != nil {
-		t.Fatalf("Get packfile failed: %v", err)
-	}
-	gotData, err := io.ReadAll(rd)
-	_ = rd.Close()
-	if err != nil || !bytes.Equal(gotData, payload) {
-		t.Fatalf("Get packfile = %q (err=%v), want %q", string(gotData), err, string(payload))
-	}
-
-	// Range Get
-	rg := &storage.Range{Offset: 4, Length: 6}
-	rdRange, err := store.Get(ctx, storage.StorageResourcePackfile, mac, rg)
-	if err != nil {
-		t.Fatalf("Get range failed: %v", err)
-	}
-	gotRange, err := io.ReadAll(rdRange)
-	_ = rdRange.Close()
-	if err != nil || string(gotRange) != "456789" {
-		t.Fatalf("Get range = %q (err=%v), want %q", string(gotRange), err, "456789")
-	}
-
-	// Delete and verify ErrPackfileNotFound
-	if err := store.Delete(ctx, storage.StorageResourcePackfile, mac); err != nil {
-		t.Fatalf("Delete packfile failed: %v", err)
-	}
-	_, err = store.Get(ctx, storage.StorageResourcePackfile, mac, nil)
-	if !errors.Is(err, repository.ErrPackfileNotFound) {
-		t.Fatalf("Get deleted packfile error = %v, want ErrPackfileNotFound", err)
+	bad := newTestConnector(t, s, map[string]string{"access_token": "wrong"})
+	if err := bad.Ping(t.Context()); err == nil {
+		t.Fatal("Ping with a bad token should fail")
 	}
 }

@@ -10,12 +10,13 @@
     "location": {
       "type": "string",
       "minLength": 1,
-      "description": "pCloud location URI: pcloud://[us|eu|api.pcloud.com|eapi.pcloud.com][/path]"
+      "pattern": "^pcloud://",
+      "description": "pCloud location URI: pcloud://[us|eu|api.pcloud.com|eapi.pcloud.com]/path. Any other host part is treated as the first folder of the path."
     },
     "access_token": {
       "type": "string",
       "minLength": 1,
-      "description": "pCloud OAuth2 access token"
+      "description": "pCloud OAuth2 access token (recommended; required for accounts with two-factor authentication)"
     },
     "auth": {
       "type": "string",
@@ -25,7 +26,7 @@
     "username": {
       "type": "string",
       "minLength": 1,
-      "description": "pCloud account email/username (used with password for digest authentication)"
+      "description": "pCloud account email (used with password for digest authentication)"
     },
     "password": {
       "type": "string",
@@ -34,7 +35,10 @@
     },
     "region": {
       "type": "string",
-      "enum": ["us", "eu"],
+      "enum": [
+        "us",
+        "eu"
+      ],
       "default": "us",
       "description": "pCloud data region: 'us' (api.pcloud.com) or 'eu' (eapi.pcloud.com)"
     },
@@ -42,22 +46,46 @@
       "type": "string",
       "default": "/",
       "pattern": "^/",
-      "description": "Absolute path inside pCloud"
+      "description": "Absolute path inside pCloud, overriding the path of the location"
     },
     "endpoint": {
       "type": "string",
       "minLength": 1,
-      "description": "Override pCloud API endpoint host (useful for testing/emulators)"
+      "description": "Custom API host[:port] for testing against a pCloud emulator (credentials are sent to this host)"
     },
     "insecure": {
       "type": "boolean",
       "default": false,
-      "description": "Use plain HTTP instead of HTTPS (useful for local testing)"
+      "description": "Use plain HTTP; only allowed together with a custom endpoint (dangerous; use only for testing)"
     },
     "debug": {
       "type": "boolean",
       "default": false,
       "description": "Enable verbose debug logging to stderr"
+    },
+    "cache_size": {
+      "type": "string",
+      "default": "256MiB",
+      "pattern": "^[0-9]+(\\.[0-9]+)? *([kKmMgGtT]i?[bB]?|[bB])?$",
+      "description": "Memory budget for caching ranged packfile reads (e.g. 64MiB, 1GB, 0 to disable). Nothing is ever cached on disk."
     }
-  }
+  },
+  "anyOf": [
+    {
+      "required": [
+        "access_token"
+      ]
+    },
+    {
+      "required": [
+        "auth"
+      ]
+    },
+    {
+      "required": [
+        "username",
+        "password"
+      ]
+    }
+  ]
 }
